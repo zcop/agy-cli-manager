@@ -5,10 +5,14 @@ from pathlib import Path
 
 from agy_cli_manager.manager import (
     add_account,
+    apply_active,
     build_paths,
+    clear_bad,
     default_root,
     ensure_layout,
     format_status,
+    mark_bad,
+    set_live_dir,
     set_enabled,
     switch_account,
     switch_next,
@@ -23,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="Create initial manager layout")
     sub.add_parser("status", help="Show current manager status")
+    sub.add_parser("apply-active", help="Re-apply the current active account to runtime and live_dir")
 
     add = sub.add_parser("add", help="Add an account profile from a source directory")
     add.add_argument("name")
@@ -38,6 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     enable = sub.add_parser("enable", help="Enable an account")
     enable.add_argument("name")
+
+    mark = sub.add_parser("mark-bad", help="Mark an account bad and optionally put it in cooldown")
+    mark.add_argument("name")
+    mark.add_argument("--reason", default="manual")
+    mark.add_argument("--cooldown-minutes", type=int, default=60)
+
+    clear = sub.add_parser("clear-bad", help="Clear cooldown/error state for an account")
+    clear.add_argument("name")
+
+    live = sub.add_parser("set-live-dir", help="Set or clear a real live CLI home directory")
+    live.add_argument("path", nargs="?")
     return parser
 
 
@@ -53,6 +69,10 @@ def main() -> int:
             return 0
         if args.command == "status":
             print(format_status(paths))
+            return 0
+        if args.command == "apply-active":
+            active = apply_active(paths)
+            print(f"applied-active: {active}")
             return 0
         if args.command == "add":
             add_account(paths, args.name, args.source_dir)
@@ -76,6 +96,19 @@ def main() -> int:
         if args.command == "enable":
             set_enabled(paths, args.name, True)
             print(f"enabled: {args.name}")
+            return 0
+        if args.command == "mark-bad":
+            mark_bad(paths, args.name, args.reason, args.cooldown_minutes)
+            print(f"marked-bad: {args.name}")
+            return 0
+        if args.command == "clear-bad":
+            clear_bad(paths, args.name)
+            print(f"cleared-bad: {args.name}")
+            return 0
+        if args.command == "set-live-dir":
+            live_dir = Path(args.path).expanduser() if args.path else None
+            set_live_dir(paths, live_dir)
+            print(f"live-dir: {live_dir if live_dir else 'cleared'}")
             return 0
     except ValueError as e:
         parser.exit(2, f"error: {e}\n")
