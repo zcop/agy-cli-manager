@@ -1,0 +1,1 @@
+"""agy-cli-manager package."""
