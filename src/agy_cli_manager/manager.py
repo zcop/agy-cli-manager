@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +23,13 @@ ACTIVE_RUNTIME_FILES = (
 )
 TOKEN_CACHE_FILES = (
     "mcp-oauth-tokens-v2.json",
+)
+AUTH_BOOTSTRAP_PROMPT = "Authentication bootstrap only. After login, reply with OK."
+AUTH_CODE_PROMPT = "paste the authorization code here"
+AUTH_INTERRUPTED_PATTERNS = (
+    "authentication interrupted",
+    "authentication timed out",
+    "error:",
 )
 
 
@@ -89,6 +102,33 @@ def account_dir(paths: ManagerPaths, name: str) -> Path:
     return paths.accounts_dir / name
 
 
+def _clear_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+
+
+def _copy_directory_contents(source: Path, target: Path) -> None:
+    _clear_directory(target)
+    for child in source.iterdir():
+        dst = target / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, dst)
+
+
+def _resolve_profile_source(source_dir: Path) -> Path:
+    source_dir = source_dir.resolve()
+    gemini_dir = source_dir / ".gemini"
+    if gemini_dir.is_dir():
+        return gemini_dir
+    return source_dir
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -152,18 +192,18 @@ def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
     if not source_dir.is_dir():
         raise ValueError(f"Source directory does not exist: {source_dir}")
 
-    src_creds = source_dir / "oauth_creds.json"
-    if not src_creds.exists():
-        raise ValueError(f"Missing oauth_creds.json in {source_dir}")
+    profile_source = _resolve_profile_source(source_dir)
+    if not profile_source.exists() or not profile_source.is_dir():
+        raise ValueError(f"Usable profile source not found in {source_dir}")
+    if not any(profile_source.iterdir()):
+        raise ValueError(f"Profile source is empty: {profile_source}")
 
     target = account_dir(paths, name)
     if target.exists():
         raise ValueError(f"Account already exists: {name}")
 
     target.mkdir(parents=True, exist_ok=False)
-    shutil.copy2(src_creds, target / "oauth_creds.json")
-    if (source_dir / "google_account_id").exists():
-        shutil.copy2(source_dir / "google_account_id", target / "google_account_id")
+    _copy_directory_contents(profile_source, target)
 
     with manager_lock(paths):
         state = load_state(paths)
@@ -176,23 +216,31 @@ def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
             "fail_count": 0,
         }
         save_state(paths, state)
+        if not state.get("active"):
+            _copy_active_runtime(paths, name)
+            state["active"] = name
+            state = sync_state_from_disk(paths, state)
+            _sync_runtime_to_live_dir(paths, state)
+            save_state(paths, state)
+
+
+def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = None) -> None:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        live_dir = source_dir or get_live_dir(state)
+        if live_dir is None:
+            raise ValueError("No source_dir provided and no live_dir configured.")
+    add_account(paths, name, live_dir)
 
 
 def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
     src = account_dir(paths, name)
     if not src.exists():
         raise ValueError(f"Account not found: {name}")
-    if not (src / "oauth_creds.json").exists():
-        raise ValueError(f"Account {name} is missing oauth_creds.json")
+    if not any(src.iterdir()):
+        raise ValueError(f"Account {name} has an empty profile directory")
 
-    for filename in ACTIVE_RUNTIME_FILES:
-        src_file = src / filename
-        dst_file = paths.runtime_dir / filename
-        if src_file.exists():
-            shutil.copy2(src_file, dst_file)
-        elif dst_file.exists():
-            dst_file.unlink()
-
+    _copy_directory_contents(src, paths.runtime_dir)
     for cache_name in TOKEN_CACHE_FILES:
         cache_file = paths.runtime_dir / cache_name
         if cache_file.exists():
@@ -203,14 +251,7 @@ def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
     live_dir = get_live_dir(state)
     if live_dir is None:
         return
-    live_dir.mkdir(parents=True, exist_ok=True)
-    for filename in ACTIVE_RUNTIME_FILES:
-        src_file = paths.runtime_dir / filename
-        dst_file = live_dir / filename
-        if src_file.exists():
-            shutil.copy2(src_file, dst_file)
-        elif dst_file.exists():
-            dst_file.unlink()
+    _copy_directory_contents(paths.runtime_dir, live_dir)
     for cache_name in TOKEN_CACHE_FILES:
         cache_file = live_dir / cache_name
         if cache_file.exists():
@@ -329,6 +370,119 @@ def apply_active(paths: ManagerPaths) -> str:
         _sync_runtime_to_live_dir(paths, state)
         save_state(paths, state)
         return active
+
+
+def login_account(
+    paths: ManagerPaths,
+    name: str,
+    agy_binary: str,
+    timeout_seconds: int = 180,
+) -> bool:
+    if not name.strip():
+        raise ValueError("Account name cannot be empty.")
+    if account_dir(paths, name).exists():
+        raise ValueError(f"Account already exists: {name}")
+
+    with tempfile.TemporaryDirectory(prefix="agy-login-") as temp_root_str:
+        temp_root = Path(temp_root_str)
+        temp_home = temp_root / "home"
+        temp_work = temp_root / "work"
+        temp_home.mkdir(parents=True, exist_ok=True)
+        temp_work.mkdir(parents=True, exist_ok=True)
+
+        master_fd, slave_fd = pty.openpty()
+        env = os.environ.copy()
+        env["HOME"] = str(temp_home)
+        env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+        try:
+            proc = subprocess.Popen(
+                [agy_binary, "-p", AUTH_BOOTSTRAP_PROMPT],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=temp_work,
+                env=env,
+                text=False,
+                close_fds=True,
+            )
+        finally:
+            os.close(slave_fd)
+
+        sent_code = False
+        auth_failed = False
+        output_buffer = ""
+        start_time = time.time()
+
+        interrupted = False
+        try:
+            while True:
+                if time.time() - start_time > timeout_seconds:
+                    raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
+
+                ready, _, _ = select.select([master_fd], [], [], 0.2)
+                if ready:
+                    chunk = os.read(master_fd, 4096)
+                    if not chunk:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    text = chunk.decode(errors="replace")
+                    output_buffer += text
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+
+                    lowered = output_buffer.lower()
+                    if not sent_code and AUTH_CODE_PROMPT.lower() in lowered:
+                        try:
+                            code = input("\nPaste authorization code: ").strip()
+                        except KeyboardInterrupt:
+                            interrupted = True
+                            break
+                        if not code:
+                            raise ValueError("Authorization code is required.")
+                        os.write(master_fd, code.encode() + b"\n")
+                        sent_code = True
+                    if any(pattern in lowered for pattern in AUTH_INTERRUPTED_PATTERNS):
+                        auth_failed = True
+                        if sent_code:
+                            break
+
+                if proc.poll() is not None:
+                    break
+                if sent_code and not auth_failed and len(list((temp_home / ".gemini").rglob("*"))) > 5:
+                    # After the code is accepted, let agy write auth state, then stop the session.
+                    time.sleep(2)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        if interrupted:
+            return False
+        if not sent_code:
+            raise ValueError("Did not reach the authorization code prompt.")
+        if auth_failed:
+            raise ValueError("agy login reported an authentication failure.")
+
+        gemini_dir = temp_home / ".gemini"
+        if not gemini_dir.is_dir() or not any(gemini_dir.rglob("*")):
+            raise ValueError("agy login did not produce a usable .gemini profile.")
+
+        add_account(paths, name, gemini_dir)
+        return True
 
 
 def format_status(paths: ManagerPaths) -> str:
