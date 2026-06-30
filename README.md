@@ -31,6 +31,20 @@ It is application-agnostic. A Telegram bot can call it, but the manager itself i
 
 ## Install
 
+From a GitHub release wheel:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.0/agy_cli_manager-0.2.0-py3-none-any.whl
+```
+
+To move to a newer release later, replace `v0.2.0` and the wheel filename with the newer version:
+
+```bash
+pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.0/agy_cli_manager-0.2.0-py3-none-any.whl
+```
+
 From this repo:
 
 ```bash
