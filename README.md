@@ -1,43 +1,115 @@
 # agy-cli-manager
 
-`agy-cli-manager` is a small manager for running one active Antigravity CLI account with standby accounts available for failover.
+`agy-cli-manager` is an active-standby account manager for Antigravity CLI (`agy`).
 
-Integration model:
+It is designed for one active account at a time:
 
-- `agy-cli-manager` is application-agnostic.
-- external apps can use it as a Python library or as a CLI with JSON output.
-- Telegram bot integration is only one possible caller, not a built-in dependency.
+- keep multiple saved `agy` profiles
+- switch the active profile explicitly or after failure
+- expose machine-readable state for external callers
+- stay usable as a CLI app, TUI dashboard, or Python library
 
-Planned scope:
+It is application-agnostic. A Telegram bot can call it, but the manager itself is not Telegram-specific.
 
-- store multiple account profiles safely
-- keep one active account at a time
-- switch to the next standby account on quota or auth failure
-- clear cached CLI token state after switching
-- expose simple CLI commands for status, switch, and health
+![Sanitized dashboard example](docs/dashboard-screenshot.svg)
 
-Current phase 1 includes:
+## What it does
 
-- manager root layout
-- account profile import from an existing directory
-- active account state
-- detected account identity from the saved profile when available
-- `switch` and `switch-next`
-- token-cache cleanup in the runtime directory
-- enable/disable account flags
+- stores multiple account profiles safely
+- keeps one account active while others stay standby/cooldown/disabled
+- supports isolated interactive `agy` login
+- can import an existing `~/.gemini` or similar live home
+- tracks cached identity, health, and usage metadata
+- exposes CLI commands and JSON output for automation
+- supports account failover with cooldowns and lock-protected state changes
 
-Phase 2 adds:
+## Requirements
 
-- global file lock for safe switching
-- cooldown state for exhausted or bad accounts
-- failure counters and last-error tracking
-- `mark-bad` and `clear-bad`
+- Python 3.10+
+- a working `agy` binary available in `PATH`, or passed explicitly with `--agy-binary`
+- a terminal if you want to use `login` or the full-screen dashboard
 
-Phase 4 adds:
+## Install
 
-- `import-current` to bootstrap from an existing live `.gemini`
-- `login <name>` to run isolated interactive `agy` OAuth and save the resulting profile
-- first successful profile auto-activates if no active account exists
+From this repo:
+
+```bash
+cd agy-cli-manager
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+```
+
+After that, you can use either:
+
+```bash
+agy-cli-manager --help
+```
+
+or:
+
+```bash
+PYTHONPATH=src python3 -m agy_cli_manager.cli --help
+```
+
+## Quick Start
+
+### 1. Initialize the manager state
+
+```bash
+agy-cli-manager init
+```
+
+By default, state lives under:
+
+```text
+~/.agy-cli-manager
+```
+
+You can override that with `--root /path/to/root`.
+
+### 2. Add your first account
+
+If you already have a live Antigravity home:
+
+```bash
+agy-cli-manager import-current my-account ~/.gemini
+```
+
+If you want the manager to drive a fresh interactive login itself:
+
+```bash
+agy-cli-manager login my-account --agy-binary /path/to/agy
+```
+
+`login` will hand your terminal to a real `agy` session. Complete the normal Antigravity onboarding/login there, then exit `agy`. The manager will save the resulting profile snapshot.
+
+### 3. Check what is active
+
+```bash
+agy-cli-manager status
+agy-cli-manager current
+agy-cli-manager list
+```
+
+### 4. Open the dashboard
+
+```bash
+agy-cli-manager
+```
+
+With no subcommand, the full-screen dashboard opens by default.
+
+## First Useful Commands
+
+```bash
+agy-cli-manager status --json
+agy-cli-manager whoami
+agy-cli-manager models --json
+agy-cli-manager refresh-usage --json
+agy-cli-manager switch-next
+agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+```
 
 Directory layout:
 
@@ -65,6 +137,15 @@ Optional integration:
 
 - `live_dir` can point at a real Antigravity/Gemini CLI home such as `~/.gemini`
 - when set, switches sync the managed CLI home snapshot into that runtime home and clear token cache there too
+
+Example:
+
+```bash
+agy-cli-manager set-live-dir ~/.gemini
+agy-cli-manager apply-active
+```
+
+This is useful when another process launches `agy` and you want that live home to always reflect the currently active saved profile.
 
 Commands:
 
@@ -112,11 +193,34 @@ agy-cli-manager update-meta account1 --short-usage-status known --short-usage-va
 - a directory that is already a `.gemini` profile root
 - or a parent directory containing `.gemini/`
 
+## JSON/API-oriented usage
+
+For automation, prefer the JSON-capable commands:
+
+```bash
+agy-cli-manager status --json
+agy-cli-manager current --json
+agy-cli-manager list --json
+agy-cli-manager refresh-usage account1 --json
+agy-cli-manager refresh-due --json
+agy-cli-manager models --json
+agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+```
+
+Typical external-app flow:
+
+1. read current state with `status --json`
+2. use `models --json` if the caller needs model choices for the active account
+3. call `refresh-usage --json` or `refresh-due --json` only when needed
+4. if a real request fails due to auth/quota, call `rotate-after-failure --json`
+5. persist caller-side observations back with `update-meta`
+
 Notes:
 
 - running `agy-cli-manager` with no subcommand opens the full-screen dashboard
 - `dashboard` is a TTY-only full-screen view with a fast local-only UI refresh and manual account actions
 - `list`, `current`, `activate`, and `rotate` are convenience commands for standalone use; they map to the same manager state as the lower-level commands.
+- local operator notes such as `AGENTS.md` are intentionally kept untracked and are not part of the public repo contract.
 - `agy-cli-manager login` prompts for the account name if you do not pass one
 - `switch-next` skips accounts in cooldown.
 - `mark-bad` clears the active pointer if that account was active.
@@ -159,4 +263,19 @@ models = list_models(paths)
 result = rotate_after_failure(paths, reason="quota", cooldown_minutes=60)
 print(snapshot["active"], "->", result.switched_to)
 print([model["name"] for model in models["models"]])
+```
+
+More explicit example:
+
+```python
+from pathlib import Path
+
+from agy_cli_manager import build_paths, ensure_layout, list_models
+
+paths = build_paths(Path.home() / ".agy-cli-manager")
+ensure_layout(paths)
+
+payload = list_models(paths)
+for model in payload["models"]:
+    print(model["name"], model["variant"])
 ```

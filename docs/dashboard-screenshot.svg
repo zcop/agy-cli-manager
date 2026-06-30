@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
+  <title id="title">agy-cli-manager terminal screenshot</title>
+  <desc id="desc">Sanitized terminal-style screenshot matching the real agy-cli-manager dashboard layout, with email addresses masked.</desc>
+  <style>
+    .mono { font-family: "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace; }
+    .fg { fill: #f2f6fb; }
+    .muted { fill: #f2f6fb; }
+    .green { fill: #5fd75f; }
+    .yellow { fill: #ffd75f; }
+    .red { fill: #ff5f5f; }
+    .cyan { fill: #5fd7ff; }
+    .blue { fill: #5f87ff; }
+    .magenta { fill: #d787ff; }
+    .title { font-size: 26px; }
+    .line { font-size: 24px; }
+    .small { font-size: 22px; }
+  </style>
+
+  <rect width="1600" height="980" fill="#0b0f14"/>
+  <rect x="34" y="28" width="1532" height="924" rx="16" fill="#10151c"/>
+  <rect x="34" y="28" width="1532" height="36" rx="16" fill="#1a2028"/>
+  <circle cx="62" cy="46" r="6" fill="#ff605c"/>
+  <circle cx="82" cy="46" r="6" fill="#ffbd44"/>
+  <circle cx="102" cy="46" r="6" fill="#00ca4e"/>
+  <text x="130" y="53" class="mono small muted">ubuntu@remote-host: ~/agy-cli-manager</text>
+
+  <text x="52" y="102" class="mono title fg">AGY CLI Manager | Active: acct-primary | Accounts: 2 | UI Refresh: 5s | Sort: added-oldest | Live Status:</text>
+  <text x="52" y="136" class="mono line cyan">Auto+Manual</text>
+  <text x="52" y="170" class="mono line blue">Actions: <tspan class="muted">[</tspan><tspan class="yellow">N</tspan><tspan class="muted">]</tspan> Login  <tspan class="muted">[</tspan><tspan class="yellow">I</tspan><tspan class="muted">]</tspan> Import  <tspan class="muted">[</tspan><tspan class="yellow">Enter/A</tspan><tspan class="muted">]</tspan> Activate  <tspan class="muted">[</tspan><tspan class="yellow">R</tspan><tspan class="muted">]</tspan> Rotate  <tspan class="muted">[</tspan><tspan class="yellow">E</tspan><tspan class="muted">]</tspan> Enable/Disable  <tspan class="muted">[</tspan><tspan class="yellow">C</tspan><tspan class="muted">]</tspan> ClearBad  <tspan class="muted">[</tspan><tspan class="yellow">M</tspan><tspan class="muted">]</tspan> MarkBad</text>
+  <text x="52" y="204" class="mono line blue"><tspan class="muted">[</tspan><tspan class="yellow">S</tspan><tspan class="muted">]</tspan> Sort  <tspan class="muted">[</tspan><tspan class="yellow">U</tspan><tspan class="muted">]</tspan> Live Usage Refresh  <tspan class="muted">[</tspan><tspan class="yellow">T</tspan><tspan class="muted">]</tspan> UI Refresh  <tspan class="muted">[</tspan><tspan class="yellow">Q</tspan><tspan class="muted">]</tspan> Quit</text>
+  <text x="52" y="238" class="mono line fg">Legend <tspan class="yellow">&gt;</tspan> selected  <tspan class="cyan">*</tspan> active  <tspan class="green">green ready</tspan>  <tspan class="yellow">yellow expiring</tspan>  <tspan class="red">red failed</tspan></text>
+
+  <text x="52" y="278" class="mono line muted">===============================================================================================================================</text>
+
+  <text x="52" y="316" class="mono line magenta">Accounts</text>
+  <text x="52" y="350" class="mono small magenta">Sel</text>
+  <text x="124" y="350" class="mono small magenta">Name</text>
+  <text x="520" y="350" class="mono small magenta">State</text>
+  <text x="690" y="350" class="mono small magenta">Usage</text>
+  <text x="860" y="350" class="mono small magenta">Reset In</text>
+  <text x="1040" y="350" class="mono small magenta">Next Ref</text>
+  <text x="1210" y="350" class="mono small magenta">Fail</text>
+  <text x="1310" y="350" class="mono small magenta">Last Error</text>
+
+  <text x="52" y="388" class="mono line fg">
+    <tspan class="yellow">&gt;</tspan>
+    <tspan x="124" class="cyan">acct-primary</tspan>
+    <tspan x="520" class="cyan">active</tspan>
+    <tspan x="690" class="green">100%/99%</tspan>
+    <tspan x="860" class="green">4h/118h</tspan>
+    <tspan x="1040" class="green">25m42s</tspan>
+    <tspan x="1210">0</tspan>
+    <tspan x="1310">-</tspan>
+  </text>
+
+  <text x="52" y="422" class="mono line fg">
+    <tspan>.</tspan>
+    <tspan x="124">acct-standby</tspan>
+    <tspan x="520">standby</tspan>
+    <tspan x="690" class="green">100%/99%</tspan>
+    <tspan x="860" class="green">4h/118h</tspan>
+    <tspan x="1040" class="green">25m58s</tspan>
+    <tspan x="1210">0</tspan>
+    <tspan x="1310">-</tspan>
+  </text>
+
+  <text x="52" y="476" class="mono line muted"> </text>
+  <text x="52" y="510" class="mono line muted"> </text>
+  <text x="52" y="544" class="mono line muted"> </text>
+
+  <text x="52" y="584" class="mono line muted">===============================================================================================================================</text>
+
+  <text x="52" y="622" class="mono line magenta">Overview</text>
+  <text x="52" y="656" class="mono line fg">Account: <tspan class="cyan">acct-primary</tspan>              Mode: <tspan class="cyan">active</tspan> | enabled      Health: <tspan class="green">healthy</tspan>           Usage: <tspan class="green">100%/99%</tspan></text>
+
+  <text x="52" y="706" class="mono line fg">Account                                                    Quota</text>
+  <text x="52" y="740" class="mono line fg">Identity: [masked]                                           Short Window: <tspan class="green">99.87</tspan> | <tspan class="green">4h55m</tspan></text>
+  <text x="52" y="774" class="mono line fg">Failures: 0                                                  Weekly Window: <tspan class="green">98.7</tspan> | <tspan class="green">118h30m</tspan></text>
+  <text x="52" y="808" class="mono line fg">Cooldown: -                                                  Live Error: <tspan class="muted">-</tspan></text>
+  <text x="52" y="842" class="mono line fg">Added: 2026-06-29T10:15:27.613507+00:00                      Last Error: -</text>
+  <text x="52" y="876" class="mono line fg">Last Check: <tspan class="blue">4m ago</tspan>                                           Policy: <tspan class="blue">auto on due + manual refresh</tspan></text>
+  <text x="52" y="910" class="mono line fg">Next Refresh: <tspan class="green">25m42s</tspan> | 1800s policy</text>
+
+  <text x="52" y="948" class="mono line muted">===============================================================================================================================</text>
+  <text x="52" y="978" class="mono line yellow">Status: Background refreshed acct-standby: 99.87%/99.05%</text>
+</svg>
