@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
-import pty
-import select
+import re
 import shutil
 import subprocess
 import sys
@@ -17,20 +17,27 @@ from contextlib import contextmanager
 import fcntl
 
 
-ACTIVE_RUNTIME_FILES = (
+MANAGED_PROFILE_FILES = (
     "oauth_creds.json",
     "google_account_id",
+    "google_accounts.json",
+    "antigravity-cli/antigravity-oauth-token",
+    "antigravity-cli/settings.json",
+)
+MANAGED_HOME_PATHS = (
+    ".gemini",
+    ".config",
+    ".cache",
+    ".local",
 )
 TOKEN_CACHE_FILES = (
     "mcp-oauth-tokens-v2.json",
 )
-AUTH_BOOTSTRAP_PROMPT = "Authentication bootstrap only. After login, reply with OK."
-AUTH_CODE_PROMPT = "paste the authorization code here"
-AUTH_INTERRUPTED_PATTERNS = (
-    "authentication interrupted",
-    "authentication timed out",
-    "error:",
+LOGIN_ARTIFACT_SETS = (
+    ("oauth_creds.json",),
+    ("antigravity-cli/antigravity-oauth-token",),
 )
+EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
 
 @dataclass
@@ -42,8 +49,25 @@ class ManagerPaths:
     lock_file: Path
 
 
+@dataclass
+class RotationResult:
+    previous_active: str | None
+    active: str | None
+    switched_to: str | None
+    marked_bad: bool
+    reason: str | None
+    cooldown_minutes: int
+
+
 def default_root() -> Path:
     return Path.home() / ".agy-cli-manager"
+
+
+def default_live_dir() -> Path:
+    env_live_dir = os.getenv("AGY_MANAGER_LIVE_DIR", "").strip()
+    if env_live_dir:
+        return Path(env_live_dir).expanduser()
+    return Path.home() / ".gemini"
 
 
 def build_paths(root: Path) -> ManagerPaths:
@@ -61,7 +85,7 @@ def ensure_layout(paths: ManagerPaths) -> None:
     paths.accounts_dir.mkdir(parents=True, exist_ok=True)
     paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     if not paths.state_file.exists():
-        save_state(paths, {"active": None, "accounts": {}, "live_dir": None})
+        save_state(paths, {"active": None, "accounts": {}, "live_dir": str(default_live_dir())})
 
 
 @contextmanager
@@ -89,7 +113,9 @@ def load_state(paths: ManagerPaths) -> dict:
         data = json.load(f)
     data.setdefault("active", None)
     data.setdefault("accounts", {})
-    data.setdefault("live_dir", None)
+    data.setdefault("live_dir", str(default_live_dir()))
+    if data.get("live_dir") is None:
+        data["live_dir"] = str(default_live_dir())
     return data
 
 
@@ -121,11 +147,101 @@ def _copy_directory_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, dst)
 
 
+def _remove_managed_home_paths(home_root: Path) -> None:
+    home_root.mkdir(parents=True, exist_ok=True)
+    for rel in MANAGED_HOME_PATHS:
+        path = home_root / rel
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _copy_managed_home_snapshot(source_home: Path, target_home: Path) -> None:
+    _remove_managed_home_paths(target_home)
+    target_home.mkdir(parents=True, exist_ok=True)
+    copied_any = False
+    for rel in MANAGED_HOME_PATHS:
+        src = source_home / rel
+        dst = target_home / rel
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            copied_any = True
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied_any = True
+
+    if copied_any:
+        return
+
+    profile_source = _resolve_profile_source(source_home)
+    if not profile_has_login_artifacts(profile_source):
+        return
+
+    target_profile = target_home / ".gemini"
+    _copy_managed_profile_files(profile_source, target_profile)
+    for name in TOKEN_CACHE_FILES:
+        src = profile_source / name
+        dst = target_profile / name
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+
+def resolve_agy_binary(agy_binary: str | None = None) -> str:
+    if agy_binary and agy_binary.strip():
+        return agy_binary.strip()
+
+    env_binary = os.getenv("AGY_BINARY", "").strip()
+    if env_binary:
+        return env_binary
+
+    path_binary = shutil.which("agy")
+    if path_binary:
+        return path_binary
+
+    install_sibling = Path(__file__).resolve().parents[3] / "agy"
+    if install_sibling.is_file() and os.access(install_sibling, os.X_OK):
+        return str(install_sibling)
+
+    raise ValueError(
+        "agy binary not found. Use --agy-binary, set AGY_BINARY, or put `agy` in PATH."
+    )
+
+
+def _copy_managed_profile_files(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for name in MANAGED_PROFILE_FILES:
+        src = source / name
+        dst = target / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_file():
+            shutil.copy2(src, dst)
+        else:
+            dst.unlink(missing_ok=True)
+
+
+def _remove_managed_profile_files(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for name in MANAGED_PROFILE_FILES + TOKEN_CACHE_FILES:
+        (target / name).unlink(missing_ok=True)
+
+
 def _resolve_profile_source(source_dir: Path) -> Path:
     source_dir = source_dir.resolve()
     gemini_dir = source_dir / ".gemini"
     if gemini_dir.is_dir():
         return gemini_dir
+    return source_dir
+
+
+def _resolve_home_source(source_dir: Path) -> Path:
+    source_dir = source_dir.resolve()
+    if (source_dir / ".gemini").is_dir():
+        return source_dir
+    if source_dir.name == ".gemini":
+        return source_dir.parent
     return source_dir
 
 
@@ -136,6 +252,10 @@ def utc_now() -> datetime:
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def get_live_dir(state: dict) -> Path | None:
@@ -143,10 +263,220 @@ def get_live_dir(state: dict) -> Path | None:
     if not value:
         return None
     return Path(value)
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
+
+
+def resolve_runtime_home(live_dir: Path | None = None) -> Path:
+    target_live_dir = live_dir or default_live_dir()
+    return target_live_dir.parent
+
+
+def _read_json_if_exists(path: Path) -> dict | list | None:
+    if not path.is_file():
         return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _read_text_if_exists(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _decode_jwt_payload(token: str) -> dict | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding)
+        return json.loads(decoded.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def detect_profile_identity(source_dir: Path) -> dict:
+    profile_source = _resolve_profile_source(source_dir)
+    google_accounts = _read_json_if_exists(profile_source / "google_accounts.json")
+    if isinstance(google_accounts, dict):
+        active = google_accounts.get("active")
+        if isinstance(active, str) and active.strip():
+            return {
+                "account_name": active.strip(),
+                "source": "google_accounts.json.active",
+            }
+
+    google_account_id = _read_text_if_exists(profile_source / "google_account_id")
+    if google_account_id:
+        return {
+            "account_name": google_account_id,
+            "source": "google_account_id",
+        }
+
+    oauth_creds = _read_json_if_exists(profile_source / "oauth_creds.json")
+    if isinstance(oauth_creds, dict):
+        id_token = oauth_creds.get("id_token")
+        if isinstance(id_token, str) and id_token.strip():
+            payload = _decode_jwt_payload(id_token.strip())
+            if isinstance(payload, dict):
+                email = payload.get("email")
+                name = payload.get("name")
+                sub = payload.get("sub")
+                account_name = email or name or sub
+                if isinstance(account_name, str) and account_name.strip():
+                    identity = {
+                        "account_name": account_name.strip(),
+                        "source": "oauth_creds.json.id_token",
+                    }
+                    if isinstance(email, str) and email.strip():
+                        identity["email"] = email.strip()
+                    if isinstance(name, str) and name.strip():
+                        identity["display_name"] = name.strip()
+                    if isinstance(sub, str) and sub.strip():
+                        identity["subject"] = sub.strip()
+                    return identity
+
+    return {
+        "account_name": None,
+        "source": "unavailable",
+    }
+
+
+def normalize_account_storage_name(value: str) -> str:
+    cleaned = value.strip().replace("/", "_").replace("\\", "_")
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        raise ValueError("Detected account name is empty.")
+    if cleaned in {".", ".."}:
+        raise ValueError("Detected account name is not usable as a storage path.")
+    return cleaned
+
+
+def next_available_account_name(paths: ManagerPaths, base_name: str) -> str:
+    candidate = base_name
+    suffix = 2
+    while account_dir(paths, candidate).exists():
+        candidate = f"{base_name}.{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _update_account_identity(state: dict, name: str, identity: dict) -> None:
+    meta = state["accounts"].setdefault(name, {})
+    meta["identity"] = identity
+
+
+def refresh_account_identity(paths: ManagerPaths, name: str) -> dict:
+    identity = detect_profile_identity(account_dir(paths, name))
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        if name not in state["accounts"]:
+            raise ValueError(f"Account not found: {name}")
+        _update_account_identity(state, name, identity)
+        save_state(paths, state)
+    return identity
+
+
+def get_account_identity(paths: ManagerPaths, name: str | None = None) -> tuple[str, dict]:
+    state = sync_state_from_disk(paths, load_state(paths))
+    resolved_name = name or state.get("active")
+    if not resolved_name:
+        raise ValueError("No active account is set.")
+    if resolved_name not in state["accounts"]:
+        raise ValueError(f"Account not found: {resolved_name}")
+    cached = state["accounts"][resolved_name].get("identity")
+    if isinstance(cached, dict) and cached.get("account_name"):
+        return resolved_name, cached
+    return resolved_name, refresh_account_identity(paths, resolved_name)
+
+
+def probe_profile_identity_via_usage(
+    source_dir: Path,
+    agy_binary: str | None = None,
+    timeout_seconds: int = 30,
+    live_dir: Path | None = None,
+) -> dict:
+    resolved_binary = resolve_agy_binary(agy_binary)
+    source_home = _resolve_home_source(source_dir)
+    profile_source = _resolve_profile_source(source_dir)
+    if not profile_has_login_artifacts(profile_source):
+        raise ValueError(f"Profile source is missing required auth files: {profile_source}")
+    runtime_home = resolve_runtime_home(live_dir)
+
+    with tempfile.TemporaryDirectory(prefix="agy-usage-restore-") as restore_root_str:
+        restore_root = Path(restore_root_str)
+        restore_home = restore_root / "home"
+        _copy_managed_home_snapshot(runtime_home, restore_home)
+        try:
+            _copy_managed_home_snapshot(source_home, runtime_home)
+
+            env = os.environ.copy()
+            env["HOME"] = str(runtime_home)
+            env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+
+            proc = subprocess.run(
+                [resolved_binary, "-p", "/usage"],
+                cwd=runtime_home,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+            if proc.returncode != 0:
+                tail = "\n".join(output.splitlines()[-8:]) if output else "no output"
+                raise ValueError(f"agy /usage failed with exit code {proc.returncode}: {tail}")
+
+            match = EMAIL_PATTERN.search(output)
+            if match:
+                return {
+                    "account_name": match.group(0),
+                    "source": "agy:/usage",
+                }
+            return {
+                "account_name": None,
+                "source": "agy:/usage",
+                "raw_hint": "\n".join(output.splitlines()[:8]),
+            }
+        finally:
+            _copy_managed_home_snapshot(restore_home, runtime_home)
+
+
+def resolve_login_profile_identity(
+    source_dir: Path,
+    agy_binary: str | None = None,
+    live_dir: Path | None = None,
+) -> dict:
+    identity = detect_profile_identity(source_dir)
+    if identity.get("account_name"):
+        return identity
+    try:
+        probe = probe_profile_identity_via_usage(
+            source_dir,
+            agy_binary=agy_binary,
+            timeout_seconds=30,
+            live_dir=live_dir,
+        )
+    except (ValueError, subprocess.TimeoutExpired):
+        return identity
+    if probe.get("account_name"):
+        return probe
+    return identity
+
+
+def profile_has_login_artifacts(profile_dir: Path) -> bool:
+    return any(
+        all((profile_dir / name).is_file() for name in artifact_set)
+        for artifact_set in LOGIN_ARTIFACT_SETS
+    )
 
 
 def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
@@ -154,6 +484,11 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     tracked = state["accounts"]
 
     for name in sorted(disk_accounts):
+        account_path = paths.accounts_dir / name
+        try:
+            created_at = datetime.fromtimestamp(account_path.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            created_at = utc_now().isoformat()
         tracked.setdefault(
             name,
             {
@@ -162,8 +497,21 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
                 "last_error": None,
                 "cooldown_until": None,
                 "fail_count": 0,
+                "created_at": created_at,
+                "usage_status": "unknown",
+                "usage_value": None,
+                "reset_at": None,
+                "last_live_check_at": None,
+                "next_live_check_at": None,
             },
         )
+        meta = tracked[name]
+        meta.setdefault("created_at", created_at)
+        meta.setdefault("usage_status", "unknown")
+        meta.setdefault("usage_value", None)
+        meta.setdefault("reset_at", None)
+        meta.setdefault("last_live_check_at", None)
+        meta.setdefault("next_live_check_at", None)
     for name in list(tracked):
         if name not in disk_accounts:
             tracked.pop(name, None)
@@ -185,36 +533,52 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     return state
 
 
-def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
+def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overwrite: bool = False) -> None:
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
     source_dir = source_dir.resolve()
     if not source_dir.is_dir():
         raise ValueError(f"Source directory does not exist: {source_dir}")
 
+    home_source = _resolve_home_source(source_dir)
     profile_source = _resolve_profile_source(source_dir)
     if not profile_source.exists() or not profile_source.is_dir():
         raise ValueError(f"Usable profile source not found in {source_dir}")
-    if not any(profile_source.iterdir()):
-        raise ValueError(f"Profile source is empty: {profile_source}")
+    if not profile_has_login_artifacts(profile_source):
+        raise ValueError(f"Profile source is missing required auth files: {profile_source}")
 
     target = account_dir(paths, name)
-    if target.exists():
+    target_exists = target.exists()
+    if target_exists and not overwrite:
         raise ValueError(f"Account already exists: {name}")
+    if not target_exists:
+        target.mkdir(parents=True, exist_ok=False)
 
-    target.mkdir(parents=True, exist_ok=False)
-    _copy_directory_contents(profile_source, target)
+    _copy_managed_home_snapshot(home_source, target)
+    identity = detect_profile_identity(target)
 
     with manager_lock(paths):
         state = load_state(paths)
         state = sync_state_from_disk(paths, state)
+        previous_meta = state["accounts"].get(name, {})
         state["accounts"][name] = {
-            "enabled": True,
-            "status": "standby",
-            "last_error": None,
-            "cooldown_until": None,
-            "fail_count": 0,
+            "enabled": previous_meta.get("enabled", True),
+            "status": previous_meta.get("status", "standby"),
+            "last_error": None if overwrite else previous_meta.get("last_error"),
+            "cooldown_until": None if overwrite else previous_meta.get("cooldown_until"),
+            "fail_count": 0 if overwrite else previous_meta.get("fail_count", 0),
+            "created_at": previous_meta.get("created_at") or utc_now().isoformat(),
+            "usage_status": previous_meta.get("usage_status", "unknown"),
+            "usage_value": previous_meta.get("usage_value"),
+            "reset_at": previous_meta.get("reset_at"),
+            "last_live_check_at": previous_meta.get("last_live_check_at"),
+            "next_live_check_at": previous_meta.get("next_live_check_at"),
+            "identity": identity,
         }
+        if overwrite and state.get("active") == name:
+            _copy_active_runtime(paths, name)
+            state = sync_state_from_disk(paths, state)
+            _sync_runtime_to_live_dir(paths, state)
         save_state(paths, state)
         if not state.get("active"):
             _copy_active_runtime(paths, name)
@@ -222,6 +586,10 @@ def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
             state = sync_state_from_disk(paths, state)
             _sync_runtime_to_live_dir(paths, state)
             save_state(paths, state)
+
+
+def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
+    save_account_profile(paths, name, source_dir, overwrite=False)
 
 
 def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = None) -> None:
@@ -237,10 +605,11 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
     src = account_dir(paths, name)
     if not src.exists():
         raise ValueError(f"Account not found: {name}")
-    if not any(src.iterdir()):
-        raise ValueError(f"Account {name} has an empty profile directory")
+    if not profile_has_login_artifacts(_resolve_profile_source(src)):
+        raise ValueError(f"Account {name} is missing required auth files")
 
-    _copy_directory_contents(src, paths.runtime_dir)
+    _clear_directory(paths.runtime_dir)
+    _copy_managed_home_snapshot(src, paths.runtime_dir)
     for cache_name in TOKEN_CACHE_FILES:
         cache_file = paths.runtime_dir / cache_name
         if cache_file.exists():
@@ -251,7 +620,7 @@ def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
     live_dir = get_live_dir(state)
     if live_dir is None:
         return
-    _copy_directory_contents(paths.runtime_dir, live_dir)
+    _copy_managed_home_snapshot(paths.runtime_dir, live_dir.parent)
     for cache_name in TOKEN_CACHE_FILES:
         cache_file = live_dir / cache_name
         if cache_file.exists():
@@ -304,6 +673,34 @@ def switch_next(paths: ManagerPaths) -> str:
         _sync_runtime_to_live_dir(paths, state)
         save_state(paths, state)
         return target
+
+
+def get_status_snapshot(paths: ManagerPaths) -> dict:
+    state = sync_state_from_disk(paths, load_state(paths))
+    snapshot_accounts = {}
+    for name, meta in sorted(state["accounts"].items()):
+        snapshot_accounts[name] = {
+            "enabled": bool(meta.get("enabled", True)),
+            "status": meta.get("status", "standby"),
+            "last_error": meta.get("last_error"),
+            "cooldown_until": meta.get("cooldown_until"),
+            "fail_count": int(meta.get("fail_count", 0) or 0),
+            "created_at": meta.get("created_at"),
+            "usage_status": meta.get("usage_status", "unknown"),
+            "usage_value": meta.get("usage_value"),
+            "reset_at": meta.get("reset_at"),
+            "last_live_check_at": meta.get("last_live_check_at"),
+            "next_live_check_at": meta.get("next_live_check_at"),
+            "identity": meta.get("identity") if isinstance(meta.get("identity"), dict) else None,
+        }
+    return {
+        "root": str(paths.root),
+        "runtime_dir": str(paths.runtime_dir),
+        "lock_file": str(paths.lock_file),
+        "live_dir": state.get("live_dir"),
+        "active": state.get("active"),
+        "accounts": snapshot_accounts,
+    }
 
 
 def set_enabled(paths: ManagerPaths, name: str, enabled: bool) -> None:
@@ -372,117 +769,165 @@ def apply_active(paths: ManagerPaths) -> str:
         return active
 
 
+def rotate_after_failure(
+    paths: ManagerPaths,
+    reason: str,
+    cooldown_minutes: int = 60,
+    live_dir: Path | None = None,
+) -> RotationResult:
+    if cooldown_minutes < 0:
+        raise ValueError("Cooldown minutes must be non-negative.")
+
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        if live_dir is not None:
+            state["live_dir"] = str(live_dir.resolve())
+
+        previous = state.get("active")
+        if not previous:
+            save_state(paths, state)
+            return RotationResult(
+                previous_active=None,
+                active=None,
+                switched_to=None,
+                marked_bad=False,
+                reason=reason,
+                cooldown_minutes=cooldown_minutes,
+            )
+
+        meta = state["accounts"].get(previous)
+        if meta is None:
+            state["active"] = None
+            save_state(paths, state)
+            return RotationResult(
+                previous_active=previous,
+                active=None,
+                switched_to=None,
+                marked_bad=False,
+                reason=reason,
+                cooldown_minutes=cooldown_minutes,
+            )
+
+        meta["last_error"] = reason
+        meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
+        if cooldown_minutes > 0:
+            meta["cooldown_until"] = (utc_now() + timedelta(minutes=cooldown_minutes)).isoformat()
+        else:
+            meta["cooldown_until"] = None
+        state["active"] = None
+        state = sync_state_from_disk(paths, state)
+
+        candidates = [
+            name
+            for name, candidate_meta in sorted(state["accounts"].items())
+            if name != previous
+            and candidate_meta.get("enabled", True)
+            and candidate_meta.get("status") != "cooldown"
+        ]
+
+        switched_to = candidates[0] if candidates else None
+        if switched_to:
+            _copy_active_runtime(paths, switched_to)
+            state["active"] = switched_to
+            state = sync_state_from_disk(paths, state)
+            _sync_runtime_to_live_dir(paths, state)
+
+        save_state(paths, state)
+        return RotationResult(
+            previous_active=previous,
+            active=state.get("active"),
+            switched_to=switched_to,
+            marked_bad=True,
+            reason=reason,
+            cooldown_minutes=cooldown_minutes,
+        )
+
+
 def login_account(
     paths: ManagerPaths,
     name: str,
-    agy_binary: str,
-    timeout_seconds: int = 180,
-) -> bool:
+    agy_binary: str | None,
+    timeout_seconds: int = 600,
+) -> str | None:
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
-    if account_dir(paths, name).exists():
-        raise ValueError(f"Account already exists: {name}")
+    if not os.isatty(sys.stdin.fileno()):
+        raise ValueError("Interactive login requires a TTY.")
 
-    with tempfile.TemporaryDirectory(prefix="agy-login-") as temp_root_str:
-        temp_root = Path(temp_root_str)
-        temp_home = temp_root / "home"
-        temp_work = temp_root / "work"
-        temp_home.mkdir(parents=True, exist_ok=True)
-        temp_work.mkdir(parents=True, exist_ok=True)
+    resolved_binary = resolve_agy_binary(agy_binary)
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        live_dir = get_live_dir(state) or default_live_dir()
+        state["live_dir"] = str(live_dir.resolve())
+        save_state(paths, state)
 
-        master_fd, slave_fd = pty.openpty()
-        env = os.environ.copy()
-        env["HOME"] = str(temp_home)
-        env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
-        try:
-            proc = subprocess.Popen(
-                [agy_binary, "-p", AUTH_BOOTSTRAP_PROMPT],
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=temp_work,
-                env=env,
-                text=False,
-                close_fds=True,
-            )
-        finally:
-            os.close(slave_fd)
+    runtime_home = live_dir.parent
+    runtime_home.mkdir(parents=True, exist_ok=True)
+    _remove_managed_home_paths(runtime_home)
 
-        sent_code = False
-        auth_failed = False
-        output_buffer = ""
-        start_time = time.time()
+    env = os.environ.copy()
+    env["HOME"] = str(runtime_home)
+    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    try:
+        proc = subprocess.Popen(
+            [resolved_binary],
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            cwd=runtime_home,
+            env=env,
+            close_fds=True,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(f"agy binary not found: {resolved_binary}") from exc
 
-        interrupted = False
-        try:
-            while True:
-                if time.time() - start_time > timeout_seconds:
-                    raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
-
-                ready, _, _ = select.select([master_fd], [], [], 0.2)
-                if ready:
-                    chunk = os.read(master_fd, 4096)
-                    if not chunk:
-                        if proc.poll() is not None:
-                            break
-                        continue
-                    text = chunk.decode(errors="replace")
-                    output_buffer += text
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-
-                    lowered = output_buffer.lower()
-                    if not sent_code and AUTH_CODE_PROMPT.lower() in lowered:
-                        try:
-                            code = input("\nPaste authorization code: ").strip()
-                        except KeyboardInterrupt:
-                            interrupted = True
-                            break
-                        if not code:
-                            raise ValueError("Authorization code is required.")
-                        os.write(master_fd, code.encode() + b"\n")
-                        sent_code = True
-                    if any(pattern in lowered for pattern in AUTH_INTERRUPTED_PATTERNS):
-                        auth_failed = True
-                        if sent_code:
-                            break
-
-                if proc.poll() is not None:
-                    break
-                if sent_code and not auth_failed and len(list((temp_home / ".gemini").rglob("*"))) > 5:
-                    # After the code is accepted, let agy write auth state, then stop the session.
-                    time.sleep(2)
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    break
-        finally:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            if proc.poll() is None:
+    start_time = time.time()
+    print("Launching real agy login session.")
+    print("Complete onboarding/login there, then exit agy to save the profile.")
+    sys.stdout.flush()
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            if time.time() - start_time > timeout_seconds:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        raise
 
-        if interrupted:
-            return False
-        if not sent_code:
-            raise ValueError("Did not reach the authorization code prompt.")
-        if auth_failed:
-            raise ValueError("agy login reported an authentication failure.")
+    if not live_dir.is_dir() or not profile_has_login_artifacts(live_dir):
+        raise ValueError("agy login did not produce a usable auth profile.")
 
-        gemini_dir = temp_home / ".gemini"
-        if not gemini_dir.is_dir() or not any(gemini_dir.rglob("*")):
-            raise ValueError("agy login did not produce a usable .gemini profile.")
+    identity = resolve_login_profile_identity(live_dir, agy_binary=resolved_binary, live_dir=live_dir)
+    detected_name = identity.get("account_name")
+    storage_name = normalize_account_storage_name(detected_name or name)
+    if detected_name and storage_name != name:
+        print(f"detected-account: {detected_name}")
+        print(f"storage-name: {storage_name}")
 
-        add_account(paths, name, gemini_dir)
-        return True
+    overwrite = False
+    if account_dir(paths, storage_name).exists():
+        prompt = f"Account '{storage_name}' already exists. Overwrite it? [y/N]: "
+        answer = input(prompt).strip().lower()
+        if answer not in {"y", "yes"}:
+            storage_name = next_available_account_name(paths, storage_name)
+            print(f"saving-as: {storage_name}")
+        else:
+            overwrite = True
+
+    save_account_profile(paths, storage_name, runtime_home, overwrite=overwrite)
+    return storage_name
 
 
 def format_status(paths: ManagerPaths) -> str:
@@ -499,6 +944,11 @@ def format_status(paths: ManagerPaths) -> str:
     for name, meta in sorted(state["accounts"].items()):
         flag = "enabled" if meta.get("enabled", True) else "disabled"
         extra = []
+        identity = meta.get("identity")
+        if isinstance(identity, dict) and identity.get("account_name"):
+            extra.append(f"account_name={identity['account_name']}")
+            if identity.get("source"):
+                extra.append(f"identity_source={identity['source']}")
         if meta.get("cooldown_until"):
             extra.append(f"cooldown_until={meta['cooldown_until']}")
         if meta.get("fail_count"):
