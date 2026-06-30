@@ -77,6 +77,8 @@ agy-cli-manager list
 agy-cli-manager current
 agy-cli-manager status
 agy-cli-manager status --json
+agy-cli-manager refresh-usage
+agy-cli-manager refresh-usage account1 --json
 agy-cli-manager whoami
 agy-cli-manager whoami account1 --refresh
 agy-cli-manager whoami account1 --probe-usage --agy-binary /path/to/agy
@@ -96,6 +98,8 @@ agy-cli-manager clear-bad account1
 agy-cli-manager set-live-dir ~/.gemini
 agy-cli-manager apply-active
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+agy-cli-manager update-meta account1 --usage-status known --usage-value 42 --reset-at 2026-07-01T00:00:00+00:00 --health-status healthy --last-live-check-at 2026-06-30T06:00:00+00:00 --next-live-check-at 2026-06-30T06:30:00+00:00 --refresh-policy-seconds 1800
+agy-cli-manager update-meta account1 --short-usage-status known --short-usage-value 97.57 --short-reset-at 2026-07-01T00:00:00+00:00 --weekly-usage-status unknown
 ```
 
 `add` accepts either:
@@ -121,7 +125,19 @@ Notes:
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
 - the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
 - `rotate-after-failure` is the public failover operation for external apps: mark the current active account bad, optionally put it in cooldown, then switch to the next eligible standby account.
+- `update-meta` lets an external app persist cached runtime metadata such as usage, reset time, health, last check, and next refresh time.
+- usage metadata is stored under `usage_windows.short` and `usage_windows.weekly`; the old flat `usage_*` and `reset_at` fields remain as compatibility aliases for the short window.
 - dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
+
+Cached runtime metadata:
+
+- usage/reset/health data is persisted in manager state
+- the dashboard list currently uses the short window for its usage and countdown columns
+- the selected-account panel shows both the short window and a reserved weekly window slot
+- on relaunch, the dashboard reuses cached metadata immediately
+- countdowns and freshness are recalculated locally from saved timestamps
+- external apps should update this metadata after real checks or real requests
+- fast dashboard refresh does not itself perform live checks
 
 Python usage:
 

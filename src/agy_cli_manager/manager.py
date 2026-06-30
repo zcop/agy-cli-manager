@@ -5,10 +5,13 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +41,14 @@ LOGIN_ARTIFACT_SETS = (
     ("antigravity-cli/antigravity-oauth-token",),
 )
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+DEFAULT_REFRESH_POLICY_SECONDS = 1800
+USAGE_WINDOW_NAMES = ("short", "weekly")
+CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com"
+CODE_ASSIST_USER_AGENT = "antigravity"
+CODE_ASSIST_LOAD_PATH = "/v1internal:loadCodeAssist"
+CODE_ASSIST_QUOTA_PATH = "/v1internal:retrieveUserQuota"
+CODE_ASSIST_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 @dataclass
@@ -57,6 +68,23 @@ class RotationResult:
     marked_bad: bool
     reason: str | None
     cooldown_minutes: int
+
+
+@dataclass
+class UsageRefreshResult:
+    account: str
+    source_home: str
+    project_id: str | None
+    plan_type: str | None
+    prompt_credits_available: int | float | None
+    prompt_credits_monthly: int | float | None
+    short_usage_status: str
+    short_usage_value: float | None
+    short_reset_at: str | None
+    weekly_usage_status: str
+    weekly_usage_value: float | None
+    weekly_reset_at: str | None
+    bucket_count: int
 
 
 def default_root() -> Path:
@@ -258,6 +286,62 @@ def parse_timestamp(value: str | None) -> datetime | None:
         return None
 
 
+def _default_usage_window() -> dict:
+    return {
+        "status": "unknown",
+        "value": None,
+        "reset_at": None,
+    }
+
+
+def _default_usage_windows() -> dict:
+    return {name: _default_usage_window() for name in USAGE_WINDOW_NAMES}
+
+
+def _normalize_usage_windows(meta: dict) -> dict:
+    raw_windows = meta.get("usage_windows")
+    windows = _default_usage_windows()
+    if isinstance(raw_windows, dict):
+        for name in USAGE_WINDOW_NAMES:
+            raw = raw_windows.get(name)
+            if not isinstance(raw, dict):
+                continue
+            windows[name] = {
+                "status": raw.get("status", "unknown") or "unknown",
+                "value": raw.get("value"),
+                "reset_at": raw.get("reset_at"),
+            }
+
+    short_window = windows["short"]
+    if short_window.get("value") is None and meta.get("usage_value") is not None:
+        short_window["value"] = meta.get("usage_value")
+    if short_window.get("status") == "unknown" and meta.get("usage_status") is not None:
+        short_window["status"] = meta.get("usage_status") or "unknown"
+    if short_window.get("reset_at") is None and meta.get("reset_at") is not None:
+        short_window["reset_at"] = meta.get("reset_at")
+    return windows
+
+
+def _sync_legacy_usage_fields(meta: dict) -> None:
+    windows = _normalize_usage_windows(meta)
+    meta["usage_windows"] = windows
+    short_window = windows["short"]
+    meta["usage_status"] = short_window.get("status", "unknown")
+    meta["usage_value"] = short_window.get("value")
+    meta["reset_at"] = short_window.get("reset_at")
+
+
+def _normalize_timestamp(value: datetime | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"Invalid timestamp value: {value}")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def get_live_dir(state: dict) -> Path | None:
     value = state.get("live_dir")
     if not value:
@@ -289,6 +373,349 @@ def _read_text_if_exists(path: Path) -> str | None:
     return value or None
 
 
+def _oauth_token_path(home_root: Path) -> Path:
+    return home_root / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+
+
+def _project_id_path(home_root: Path) -> Path:
+    return home_root / ".gemini" / "antigravity-cli" / "cache" / "default_project_id.txt"
+
+
+def _load_antigravity_token_state(home_root: Path) -> dict:
+    path = _oauth_token_path(home_root)
+    data = _read_json_if_exists(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"Antigravity token file not found or invalid: {path}")
+    token = data.get("token")
+    if not isinstance(token, dict):
+        raise ValueError(f"Antigravity token payload missing token object: {path}")
+    return data
+
+
+def _extract_access_token(home_root: Path) -> str:
+    data = _load_antigravity_token_state(home_root)
+    token = data.get("token")
+    access_token = token.get("access_token") if isinstance(token, dict) else None
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ValueError("Antigravity access token is missing.")
+    return access_token.strip()
+
+
+def _token_expiry_due(home_root: Path, skew_seconds: int = 120) -> bool:
+    data = _load_antigravity_token_state(home_root)
+    token = data.get("token")
+    expiry_raw = token.get("expiry") if isinstance(token, dict) else None
+    if not isinstance(expiry_raw, str) or not expiry_raw.strip():
+        return False
+    expiry = parse_timestamp(expiry_raw.strip().replace("Z", "+00:00"))
+    if expiry is None:
+        return False
+    return expiry <= utc_now() + timedelta(seconds=skew_seconds)
+
+
+def _persist_project_id(home_root: Path, project_id: str | None) -> None:
+    if not project_id:
+        return
+    path = _project_id_path(home_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(project_id.strip() + "\n", encoding="utf-8")
+
+
+def _extract_project_id(load_response: dict, home_root: Path) -> str | None:
+    project = load_response.get("cloudaicompanionProject")
+    if isinstance(project, str) and project.strip():
+        _persist_project_id(home_root, project.strip())
+        return project.strip()
+    if isinstance(project, dict):
+        project_id = project.get("id")
+        if isinstance(project_id, str) and project_id.strip():
+            _persist_project_id(home_root, project_id.strip())
+            return project_id.strip()
+    cached = _read_text_if_exists(_project_id_path(home_root))
+    return cached.strip() if isinstance(cached, str) and cached.strip() else None
+
+
+def _cloudcode_request(access_token: str, path: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        CODE_ASSIST_BASE_URL + path,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + access_token,
+            "Content-Type": "application/json",
+            "User-Agent": CODE_ASSIST_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"Unexpected Cloud Code response type for {path}")
+            return data
+    except urllib.error.HTTPError as exc:
+        message = ""
+        try:
+            payload_text = exc.read().decode("utf-8", "replace")
+            payload_data = json.loads(payload_text)
+            if isinstance(payload_data, dict):
+                error_data = payload_data.get("error")
+                if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
+                    message = error_data["message"]
+        except Exception:
+            message = ""
+        if exc.code == 401:
+            raise PermissionError(message or "Cloud Code authentication failed.") from exc
+        raise ValueError(message or f"Cloud Code request failed with HTTP {exc.code}.") from exc
+
+
+def _google_userinfo_request(access_token: str) -> dict:
+    req = urllib.request.Request(
+        GOOGLE_USERINFO_URL,
+        headers={
+            "Authorization": "Bearer " + access_token,
+            "User-Agent": CODE_ASSIST_USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Unexpected Google userinfo response type.")
+            return data
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise PermissionError("Google userinfo authentication failed.") from exc
+        raise ValueError(f"Google userinfo request failed with HTTP {exc.code}.") from exc
+
+
+def _run_agy_warmup(home_root: Path, agy_binary: str | None, timeout_seconds: int) -> None:
+    resolved_binary = resolve_agy_binary(agy_binary)
+    env = os.environ.copy()
+    env["HOME"] = str(home_root)
+    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    proc = subprocess.run(
+        [
+            resolved_binary,
+            "--dangerously-skip-permissions",
+            "-p",
+            "reply with one word: pong",
+        ],
+        cwd=home_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=max(10, timeout_seconds),
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"exit {proc.returncode}"
+        raise ValueError(f"agy warmup failed: {detail[:200]}")
+
+
+def _parse_summary_bucket(bucket: dict) -> dict:
+    remaining = bucket.get("remainingFraction")
+    reset_raw = bucket.get("resetTime")
+    reset_at = None
+    if isinstance(reset_raw, str):
+        reset_at = _normalize_timestamp(reset_raw.replace("Z", "+00:00"))
+    return {
+        "status": "known" if isinstance(remaining, (int, float)) or reset_at else "unknown",
+        "value": round(float(remaining) * 100, 2) if isinstance(remaining, (int, float)) else None,
+        "reset_at": reset_at,
+    }
+
+
+def _select_quota_summary_group(summary_response: dict) -> dict | None:
+    groups = summary_response.get("groups")
+    if not isinstance(groups, list):
+        return None
+    normalized = [group for group in groups if isinstance(group, dict)]
+    if not normalized:
+        return None
+    for group in normalized:
+        display_name = group.get("displayName")
+        if isinstance(display_name, str) and "gemini" in display_name.lower():
+            return group
+    return normalized[0]
+
+
+def _parse_quota_windows_from_summary(summary_response: dict) -> tuple[dict, dict, int]:
+    group = _select_quota_summary_group(summary_response)
+    if not isinstance(group, dict):
+        return _default_usage_window(), _default_usage_window(), 0
+    buckets = group.get("buckets")
+    if not isinstance(buckets, list):
+        return _default_usage_window(), _default_usage_window(), 0
+
+    short_window = _default_usage_window()
+    weekly_window = _default_usage_window()
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        window_name = bucket.get("window")
+        if window_name == "5h":
+            short_window = _parse_summary_bucket(bucket)
+        elif window_name == "weekly":
+            weekly_window = _parse_summary_bucket(bucket)
+    return short_window, weekly_window, len(buckets)
+
+
+def _resolve_usage_refresh_target(paths: ManagerPaths, state: dict, name: str | None) -> tuple[str, Path]:
+    account_name = name or state.get("active")
+    if not account_name:
+        raise ValueError("No active account is set.")
+    if account_name not in state["accounts"]:
+        raise ValueError(f"Account not found: {account_name}")
+    if name is None:
+        live_dir = get_live_dir(state)
+        if live_dir is not None:
+            return account_name, live_dir.parent
+        return account_name, paths.runtime_dir
+    return account_name, account_dir(paths, account_name)
+
+
+def _persist_refresh_failure(paths: ManagerPaths, account_name: str, error: str) -> None:
+    failed_at = utc_now()
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        meta = state["accounts"].get(account_name)
+        if meta is None:
+            return
+        meta["health_status"] = "refresh_failed"
+        meta["last_live_check_error"] = error
+        meta["next_live_check_at"] = _normalize_timestamp(failed_at + timedelta(minutes=5))
+        save_state(paths, state)
+
+
+def refresh_account_usage(
+    paths: ManagerPaths,
+    name: str | None = None,
+    *,
+    agy_binary: str | None = None,
+    warmup_timeout_seconds: int = 45,
+) -> UsageRefreshResult:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        account_name, source_home = _resolve_usage_refresh_target(paths, state, name)
+    try:
+        needs_warmup = False
+        try:
+            access_token = _extract_access_token(source_home)
+            needs_warmup = _token_expiry_due(source_home)
+        except ValueError:
+            needs_warmup = True
+            access_token = None
+
+        if needs_warmup:
+            _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+            access_token = _extract_access_token(source_home)
+
+        try:
+            load_response = _cloudcode_request(
+                access_token,
+                CODE_ASSIST_LOAD_PATH,
+                {
+                    "metadata": {
+                        "ideType": "ANTIGRAVITY",
+                        "platform": "PLATFORM_UNSPECIFIED",
+                        "pluginType": "GEMINI",
+                    }
+                },
+            )
+        except PermissionError:
+            _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+            access_token = _extract_access_token(source_home)
+            load_response = _cloudcode_request(
+                access_token,
+                CODE_ASSIST_LOAD_PATH,
+                {
+                    "metadata": {
+                        "ideType": "ANTIGRAVITY",
+                        "platform": "PLATFORM_UNSPECIFIED",
+                        "pluginType": "GEMINI",
+                    }
+                },
+            )
+
+        project_id = _extract_project_id(load_response, source_home)
+        if not project_id:
+            raise ValueError("Cloud Code project id is unavailable.")
+
+        quota_response = _cloudcode_request(access_token, CODE_ASSIST_QUOTA_SUMMARY_PATH, {"project": project_id})
+        short_window, weekly_window, bucket_count = _parse_quota_windows_from_summary(quota_response)
+        plan_info = load_response.get("planInfo")
+        plan_type = plan_info.get("planType") if isinstance(plan_info, dict) else None
+        monthly = plan_info.get("monthlyPromptCredits") if isinstance(plan_info, dict) else None
+        available = load_response.get("availablePromptCredits")
+
+        result = UsageRefreshResult(
+            account=account_name,
+            source_home=str(source_home),
+            project_id=project_id,
+            plan_type=plan_type if isinstance(plan_type, str) else None,
+            prompt_credits_available=available if isinstance(available, (int, float)) else None,
+            prompt_credits_monthly=monthly if isinstance(monthly, (int, float)) else None,
+            short_usage_status=short_window.get("status", "unknown"),
+            short_usage_value=short_window.get("value"),
+            short_reset_at=short_window.get("reset_at"),
+            weekly_usage_status=weekly_window.get("status", "unknown"),
+            weekly_usage_value=weekly_window.get("value"),
+            weekly_reset_at=weekly_window.get("reset_at"),
+            bucket_count=bucket_count,
+        )
+
+        refreshed_at = utc_now()
+        if source_home != account_dir(paths, account_name):
+            target_dir = account_dir(paths, account_name)
+            if target_dir.exists():
+                source_profile = _resolve_profile_source(source_home)
+                target_profile = target_dir / ".gemini"
+                _copy_managed_profile_files(source_profile, target_profile)
+                project_id_file = _project_id_path(source_home)
+                if project_id_file.is_file():
+                    dst_project_id = _project_id_path(target_dir)
+                    dst_project_id.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(project_id_file, dst_project_id)
+        refreshed_identity = detect_profile_identity(account_dir(paths, account_name))
+        if not refreshed_identity.get("account_name") and isinstance(access_token, str) and access_token.strip():
+            try:
+                live_identity = _best_effort_live_identity(access_token.strip())
+                if live_identity:
+                    refreshed_identity = live_identity
+            except (PermissionError, ValueError):
+                pass
+        with manager_lock(paths):
+            state = sync_state_from_disk(paths, load_state(paths))
+            meta = state["accounts"].get(account_name)
+            if meta is None:
+                raise ValueError(f"Account not found: {account_name}")
+            windows = _normalize_usage_windows(meta)
+            windows["short"]["status"] = result.short_usage_status
+            windows["short"]["value"] = result.short_usage_value
+            windows["short"]["reset_at"] = result.short_reset_at
+            windows["weekly"]["status"] = result.weekly_usage_status
+            windows["weekly"]["value"] = result.weekly_usage_value
+            windows["weekly"]["reset_at"] = result.weekly_reset_at
+            meta["usage_windows"] = windows
+            meta["health_status"] = "healthy"
+            meta["last_live_check_at"] = _normalize_timestamp(refreshed_at)
+            meta["last_live_check_error"] = None
+            policy_seconds = int(meta.get("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS) or DEFAULT_REFRESH_POLICY_SECONDS)
+            meta["next_live_check_at"] = _normalize_timestamp(refreshed_at + timedelta(seconds=policy_seconds))
+            meta["identity"] = refreshed_identity
+            _sync_legacy_usage_fields(meta)
+            save_state(paths, state)
+
+        return result
+    except Exception as exc:
+        _persist_refresh_failure(paths, account_name, str(exc))
+        raise
+
+
 def _decode_jwt_payload(token: str) -> dict | None:
     parts = token.split(".")
     if len(parts) < 2:
@@ -302,46 +729,153 @@ def _decode_jwt_payload(token: str) -> dict | None:
         return None
 
 
-def detect_profile_identity(source_dir: Path) -> dict:
-    profile_source = _resolve_profile_source(source_dir)
-    google_accounts = _read_json_if_exists(profile_source / "google_accounts.json")
+def _identity_from_payload(payload: dict, source: str) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    email = payload.get("email")
+    name = payload.get("name")
+    subject = payload.get("sub") or payload.get("id")
+    account_name = None
+    if isinstance(email, str) and email.strip():
+        account_name = email.strip()
+    elif isinstance(name, str) and name.strip():
+        account_name = name.strip()
+    elif isinstance(subject, str) and subject.strip():
+        account_name = subject.strip()
+    if not account_name:
+        return None
+    identity = {
+        "account_name": account_name,
+        "source": source,
+    }
+    if isinstance(email, str) and email.strip():
+        identity["email"] = email.strip()
+    if isinstance(name, str) and name.strip():
+        identity["display_name"] = name.strip()
+    if isinstance(subject, str) and subject.strip():
+        identity["subject"] = subject.strip()
+    return identity
+
+
+def _identity_from_google_accounts(google_accounts: dict | list) -> dict | None:
     if isinstance(google_accounts, dict):
         active = google_accounts.get("active")
         if isinstance(active, str) and active.strip():
-            return {
+            identity = {
                 "account_name": active.strip(),
                 "source": "google_accounts.json.active",
             }
+            if "@" in active:
+                identity["email"] = active.strip()
+            return identity
+        accounts = google_accounts.get("accounts") or google_accounts.get("old")
+        if isinstance(accounts, list):
+            for entry in accounts:
+                if isinstance(entry, str) and entry.strip() and "@" in entry:
+                    return {
+                        "account_name": entry.strip(),
+                        "email": entry.strip(),
+                        "source": "google_accounts.json.accounts",
+                    }
+                if isinstance(entry, dict):
+                    identity = _identity_from_payload(entry, "google_accounts.json.accounts")
+                    if identity:
+                        return identity
+    elif isinstance(google_accounts, list):
+        for entry in google_accounts:
+            if isinstance(entry, dict):
+                identity = _identity_from_payload(entry, "google_accounts.json")
+                if identity:
+                    return identity
+            elif isinstance(entry, str) and entry.strip() and "@" in entry:
+                return {
+                    "account_name": entry.strip(),
+                    "email": entry.strip(),
+                    "source": "google_accounts.json",
+                }
+    return None
+
+
+def _identity_from_oauth_creds(oauth_creds: dict) -> dict | None:
+    if not isinstance(oauth_creds, dict):
+        return None
+    direct_identity = _identity_from_payload(oauth_creds, "oauth_creds.json")
+    if direct_identity:
+        return direct_identity
+    for key in ("user", "user_info", "userinfo", "profile"):
+        nested = oauth_creds.get(key)
+        if isinstance(nested, dict):
+            nested_identity = _identity_from_payload(nested, f"oauth_creds.json.{key}")
+            if nested_identity:
+                return nested_identity
+    for token_key in ("id_token", "token", "access_token"):
+        token_value = oauth_creds.get(token_key)
+        if isinstance(token_value, str) and token_value.strip() and token_value.count(".") >= 2:
+            payload = _decode_jwt_payload(token_value.strip())
+            identity = _identity_from_payload(payload or {}, f"oauth_creds.json.{token_key}")
+            if identity:
+                return identity
+    return None
+
+
+def _identity_from_antigravity_token(token_state: dict) -> dict | None:
+    if not isinstance(token_state, dict):
+        return None
+    direct_identity = _identity_from_payload(token_state, "antigravity-oauth-token")
+    if direct_identity:
+        return direct_identity
+    token = token_state.get("token")
+    if isinstance(token, dict):
+        token_identity = _identity_from_payload(token, "antigravity-oauth-token.token")
+        if token_identity:
+            return token_identity
+        for token_key in ("id_token", "access_token"):
+            token_value = token.get(token_key)
+            if isinstance(token_value, str) and token_value.strip() and token_value.count(".") >= 2:
+                payload = _decode_jwt_payload(token_value.strip())
+                identity = _identity_from_payload(payload or {}, f"antigravity-oauth-token.token.{token_key}")
+                if identity:
+                    return identity
+    return None
+
+
+def _best_effort_live_identity(access_token: str) -> dict | None:
+    userinfo = _google_userinfo_request(access_token)
+    return _identity_from_payload(userinfo, "google_userinfo")
+
+
+def detect_profile_identity(source_dir: Path) -> dict:
+    profile_source = _resolve_profile_source(source_dir)
+    google_accounts = _read_json_if_exists(profile_source / "google_accounts.json")
+    if google_accounts is not None:
+        identity = _identity_from_google_accounts(google_accounts)
+        if identity:
+            return identity
 
     google_account_id = _read_text_if_exists(profile_source / "google_account_id")
     if google_account_id:
-        return {
+        identity = {
             "account_name": google_account_id,
             "source": "google_account_id",
         }
+        if "@" in google_account_id:
+            identity["email"] = google_account_id
+        return identity
 
     oauth_creds = _read_json_if_exists(profile_source / "oauth_creds.json")
     if isinstance(oauth_creds, dict):
-        id_token = oauth_creds.get("id_token")
-        if isinstance(id_token, str) and id_token.strip():
-            payload = _decode_jwt_payload(id_token.strip())
-            if isinstance(payload, dict):
-                email = payload.get("email")
-                name = payload.get("name")
-                sub = payload.get("sub")
-                account_name = email or name or sub
-                if isinstance(account_name, str) and account_name.strip():
-                    identity = {
-                        "account_name": account_name.strip(),
-                        "source": "oauth_creds.json.id_token",
-                    }
-                    if isinstance(email, str) and email.strip():
-                        identity["email"] = email.strip()
-                    if isinstance(name, str) and name.strip():
-                        identity["display_name"] = name.strip()
-                    if isinstance(sub, str) and sub.strip():
-                        identity["subject"] = sub.strip()
-                    return identity
+        identity = _identity_from_oauth_creds(oauth_creds)
+        if identity:
+            return identity
+
+    try:
+        token_state = _load_antigravity_token_state(_resolve_home_source(source_dir))
+    except ValueError:
+        token_state = None
+    if isinstance(token_state, dict):
+        identity = _identity_from_antigravity_token(token_state)
+        if identity:
+            return identity
 
     return {
         "account_name": None,
@@ -479,6 +1013,33 @@ def profile_has_login_artifacts(profile_dir: Path) -> bool:
     )
 
 
+def _derive_health_status(paths: ManagerPaths, name: str, meta: dict) -> str:
+    if not meta.get("enabled", True):
+        return "disabled"
+    cooldown_until = parse_timestamp(meta.get("cooldown_until"))
+    if cooldown_until and cooldown_until > utc_now():
+        return "cooldown"
+    account_path = account_dir(paths, name)
+    profile_source = _resolve_profile_source(account_path)
+    if not profile_has_login_artifacts(profile_source):
+        return "auth_missing"
+    try:
+        source_home = _resolve_home_source(account_path)
+        _extract_access_token(source_home)
+        if _token_expiry_due(source_home):
+            return "auth_expired"
+    except ValueError:
+        pass
+    if meta.get("last_live_check_error"):
+        return "refresh_failed"
+    next_live_check_at = parse_timestamp(meta.get("next_live_check_at"))
+    if next_live_check_at and next_live_check_at <= utc_now():
+        return "stale"
+    if meta.get("last_live_check_at"):
+        return "healthy"
+    return "ready"
+
+
 def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     disk_accounts = {p.name for p in paths.accounts_dir.iterdir() if p.is_dir()}
     tracked = state["accounts"]
@@ -498,20 +1059,26 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
                 "cooldown_until": None,
                 "fail_count": 0,
                 "created_at": created_at,
+                "usage_windows": _default_usage_windows(),
                 "usage_status": "unknown",
                 "usage_value": None,
                 "reset_at": None,
+                "health_status": "unknown",
                 "last_live_check_at": None,
+                "last_live_check_error": None,
                 "next_live_check_at": None,
+                "refresh_policy_seconds": DEFAULT_REFRESH_POLICY_SECONDS,
             },
         )
         meta = tracked[name]
         meta.setdefault("created_at", created_at)
-        meta.setdefault("usage_status", "unknown")
-        meta.setdefault("usage_value", None)
-        meta.setdefault("reset_at", None)
+        meta.setdefault("usage_windows", _default_usage_windows())
+        meta.setdefault("health_status", "unknown")
         meta.setdefault("last_live_check_at", None)
+        meta.setdefault("last_live_check_error", None)
         meta.setdefault("next_live_check_at", None)
+        meta.setdefault("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS)
+        _sync_legacy_usage_fields(meta)
     for name in list(tracked):
         if name not in disk_accounts:
             tracked.pop(name, None)
@@ -568,13 +1135,18 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
             "cooldown_until": None if overwrite else previous_meta.get("cooldown_until"),
             "fail_count": 0 if overwrite else previous_meta.get("fail_count", 0),
             "created_at": previous_meta.get("created_at") or utc_now().isoformat(),
+            "usage_windows": _normalize_usage_windows(previous_meta),
             "usage_status": previous_meta.get("usage_status", "unknown"),
             "usage_value": previous_meta.get("usage_value"),
             "reset_at": previous_meta.get("reset_at"),
+            "health_status": previous_meta.get("health_status", "unknown"),
             "last_live_check_at": previous_meta.get("last_live_check_at"),
+            "last_live_check_error": previous_meta.get("last_live_check_error"),
             "next_live_check_at": previous_meta.get("next_live_check_at"),
+            "refresh_policy_seconds": int(previous_meta.get("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS) or DEFAULT_REFRESH_POLICY_SECONDS),
             "identity": identity,
         }
+        _sync_legacy_usage_fields(state["accounts"][name])
         if overwrite and state.get("active") == name:
             _copy_active_runtime(paths, name)
             state = sync_state_from_disk(paths, state)
@@ -679,6 +1251,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
     state = sync_state_from_disk(paths, load_state(paths))
     snapshot_accounts = {}
     for name, meta in sorted(state["accounts"].items()):
+        derived_health_status = _derive_health_status(paths, name, meta)
         snapshot_accounts[name] = {
             "enabled": bool(meta.get("enabled", True)),
             "status": meta.get("status", "standby"),
@@ -686,11 +1259,16 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
             "cooldown_until": meta.get("cooldown_until"),
             "fail_count": int(meta.get("fail_count", 0) or 0),
             "created_at": meta.get("created_at"),
+            "usage_windows": _normalize_usage_windows(meta),
             "usage_status": meta.get("usage_status", "unknown"),
             "usage_value": meta.get("usage_value"),
             "reset_at": meta.get("reset_at"),
+            "health_status": derived_health_status,
+            "stored_health_status": meta.get("health_status", "unknown"),
             "last_live_check_at": meta.get("last_live_check_at"),
+            "last_live_check_error": meta.get("last_live_check_error"),
             "next_live_check_at": meta.get("next_live_check_at"),
+            "refresh_policy_seconds": int(meta.get("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS) or DEFAULT_REFRESH_POLICY_SECONDS),
             "identity": meta.get("identity") if isinstance(meta.get("identity"), dict) else None,
         }
     return {
@@ -746,6 +1324,67 @@ def clear_bad(paths: ManagerPaths, name: str) -> None:
         meta["cooldown_until"] = None
         state = sync_state_from_disk(paths, state)
         save_state(paths, state)
+
+
+def update_account_runtime_metadata(
+    paths: ManagerPaths,
+    name: str,
+    *,
+    usage_status: str | None = None,
+    usage_value: str | int | float | None = None,
+    reset_at: datetime | str | None = None,
+    short_usage_status: str | None = None,
+    short_usage_value: str | int | float | None = None,
+    short_reset_at: datetime | str | None = None,
+    weekly_usage_status: str | None = None,
+    weekly_usage_value: str | int | float | None = None,
+    weekly_reset_at: datetime | str | None = None,
+    health_status: str | None = None,
+    last_live_check_at: datetime | str | None = None,
+    last_live_check_error: str | None = None,
+    next_live_check_at: datetime | str | None = None,
+    refresh_policy_seconds: int | None = None,
+) -> dict:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        meta = state["accounts"].get(name)
+        if meta is None:
+            raise ValueError(f"Account not found: {name}")
+        windows = _normalize_usage_windows(meta)
+        if usage_status is not None:
+            windows["short"]["status"] = usage_status
+        if usage_value is not None:
+            windows["short"]["value"] = usage_value
+        if reset_at is not None:
+            windows["short"]["reset_at"] = _normalize_timestamp(reset_at)
+        if short_usage_status is not None:
+            windows["short"]["status"] = short_usage_status
+        if short_usage_value is not None:
+            windows["short"]["value"] = short_usage_value
+        if short_reset_at is not None:
+            windows["short"]["reset_at"] = _normalize_timestamp(short_reset_at)
+        if weekly_usage_status is not None:
+            windows["weekly"]["status"] = weekly_usage_status
+        if weekly_usage_value is not None:
+            windows["weekly"]["value"] = weekly_usage_value
+        if weekly_reset_at is not None:
+            windows["weekly"]["reset_at"] = _normalize_timestamp(weekly_reset_at)
+        meta["usage_windows"] = windows
+        _sync_legacy_usage_fields(meta)
+        if health_status is not None:
+            meta["health_status"] = health_status
+        if last_live_check_at is not None:
+            meta["last_live_check_at"] = _normalize_timestamp(last_live_check_at)
+        if last_live_check_error is not None:
+            meta["last_live_check_error"] = last_live_check_error
+        if next_live_check_at is not None:
+            meta["next_live_check_at"] = _normalize_timestamp(next_live_check_at)
+        if refresh_policy_seconds is not None:
+            if refresh_policy_seconds <= 0:
+                raise ValueError("refresh_policy_seconds must be positive.")
+            meta["refresh_policy_seconds"] = int(refresh_policy_seconds)
+        save_state(paths, state)
+        return get_status_snapshot(paths)["accounts"][name]
 
 
 def set_live_dir(paths: ManagerPaths, live_dir: Path | None) -> None:
