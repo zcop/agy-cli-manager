@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agy-cli-manager"
-version = "0.1.0"
+version = "0.2.0"
 description = "Active-standby account manager for Antigravity CLI"
 requires-python = ">=3.10"
 readme = "README.md"
