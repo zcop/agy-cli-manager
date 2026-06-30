@@ -21,13 +21,16 @@ from agy_cli_manager.manager import (
     format_status,
     get_account_identity,
     get_live_dir,
+    pick_due_refresh_account,
     get_status_snapshot,
     import_current,
+    list_models,
     login_account,
     load_state,
     mark_bad,
     probe_profile_identity_via_usage,
     refresh_account_usage,
+    refresh_due_account,
     refresh_account_identity,
     rotate_after_failure,
     set_live_dir,
@@ -58,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_usage.add_argument("--agy-binary")
     refresh_usage.add_argument("--warmup-timeout-seconds", type=int, default=45)
     refresh_usage.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    refresh_due = sub.add_parser("refresh-due", help="Refresh the first due eligible account and persist cached usage metadata")
+    refresh_due.add_argument("--agy-binary")
+    refresh_due.add_argument("--warmup-timeout-seconds", type=int, default=45)
+    refresh_due.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    models = sub.add_parser("models", help="List available models for the active or named account")
+    models.add_argument("name", nargs="?")
+    models.add_argument("--agy-binary")
+    models.add_argument("--timeout-seconds", type=int, default=30)
+    models.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     whoami = sub.add_parser("whoami", help="Show the detected account identity for the active or named profile")
     whoami.add_argument("name", nargs="?")
     whoami.add_argument("--refresh", action="store_true", help="Refresh cached identity from profile files")
@@ -1290,6 +1302,60 @@ def main() -> int:
                     f"refreshed-usage: {result.account} short={short_value} "
                     f"reset_at={result.short_reset_at or '-'} buckets={result.bucket_count}"
                 )
+            return 0
+        if args.command == "refresh-due":
+            candidate = pick_due_refresh_account(paths)
+            result = refresh_due_account(
+                paths,
+                agy_binary=args.agy_binary,
+                warmup_timeout_seconds=args.warmup_timeout_seconds,
+            )
+            if result is None:
+                payload = {"refreshed": False, "account": None, "reason": "no_due_account"}
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print("refresh-due: no due eligible account")
+                return 0
+            payload = {
+                "refreshed": True,
+                "account": result.account,
+                "requested_account": candidate,
+                "source_home": result.source_home,
+                "project_id": result.project_id,
+                "plan_type": result.plan_type,
+                "prompt_credits_available": result.prompt_credits_available,
+                "prompt_credits_monthly": result.prompt_credits_monthly,
+                "short_usage_status": result.short_usage_status,
+                "short_usage_value": result.short_usage_value,
+                "short_reset_at": result.short_reset_at,
+                "weekly_usage_status": result.weekly_usage_status,
+                "weekly_usage_value": result.weekly_usage_value,
+                "weekly_reset_at": result.weekly_reset_at,
+                "bucket_count": result.bucket_count,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                short_value = "-" if result.short_usage_value is None else f"{result.short_usage_value:.2f}%"
+                print(
+                    f"refresh-due: {result.account} short={short_value} "
+                    f"reset_at={result.short_reset_at or '-'} buckets={result.bucket_count}"
+                )
+            return 0
+        if args.command == "models":
+            payload = list_models(
+                paths,
+                args.name,
+                agy_binary=args.agy_binary,
+                timeout_seconds=args.timeout_seconds,
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(f"account: {payload['account']}")
+                for model in payload["models"]:
+                    print(model["name"])
             return 0
         if args.command == "add":
             add_account(paths, args.name, args.source_dir)

@@ -79,6 +79,11 @@ agy-cli-manager status
 agy-cli-manager status --json
 agy-cli-manager refresh-usage
 agy-cli-manager refresh-usage account1 --json
+agy-cli-manager refresh-due
+agy-cli-manager refresh-due --json
+agy-cli-manager models
+agy-cli-manager models --json
+agy-cli-manager models account1 --json
 agy-cli-manager whoami
 agy-cli-manager whoami account1 --refresh
 agy-cli-manager whoami account1 --probe-usage --agy-binary /path/to/agy
@@ -123,9 +128,11 @@ Notes:
 - `login` stores the profile under the detected account name when available, not just the typed label.
 - if that detected account already exists, `login` warns and asks whether to overwrite the saved profile.
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
+- `models` runs `agy models` for the active account or a named saved profile and can return structured JSON for external callers.
 - the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
 - `rotate-after-failure` is the public failover operation for external apps: mark the current active account bad, optionally put it in cooldown, then switch to the next eligible standby account.
 - `update-meta` lets an external app persist cached runtime metadata such as usage, reset time, health, last check, and next refresh time.
+- `refresh-due` is the non-interactive refresh entrypoint for cron/systemd/external callers; it refreshes the active account first when due, otherwise the first due eligible standby account.
 - usage metadata is stored under `usage_windows.short` and `usage_windows.weekly`; the old flat `usage_*` and `reset_at` fields remain as compatibility aliases for the short window.
 - dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
 
@@ -144,10 +151,12 @@ Python usage:
 ```python
 from pathlib import Path
 
-from agy_cli_manager import build_paths, rotate_after_failure, get_status_snapshot
+from agy_cli_manager import build_paths, get_status_snapshot, list_models, rotate_after_failure
 
 paths = build_paths(Path.home() / ".agy-cli-manager")
 snapshot = get_status_snapshot(paths)
+models = list_models(paths)
 result = rotate_after_failure(paths, reason="quota", cooldown_minutes=60)
 print(snapshot["active"], "->", result.switched_to)
+print([model["name"] for model in models["models"]])
 ```

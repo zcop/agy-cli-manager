@@ -41,6 +41,7 @@ LOGIN_ARTIFACT_SETS = (
     ("antigravity-cli/antigravity-oauth-token",),
 )
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+APPLY_AUTH_EMAIL_PATTERN = re.compile(r"applyAuthResult:\s+email=([^,\s]+)", re.IGNORECASE)
 DEFAULT_REFRESH_POLICY_SECONDS = 1800
 USAGE_WINDOW_NAMES = ("short", "weekly")
 CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com"
@@ -85,6 +86,31 @@ class UsageRefreshResult:
     weekly_usage_value: float | None
     weekly_reset_at: str | None
     bucket_count: int
+
+
+def _parse_model_label(value: str) -> dict | None:
+    label = value.strip()
+    if not label:
+        return None
+    variant = None
+    base = label
+    match = re.match(r"^(?P<base>.+?) \((?P<variant>[^()]+)\)$", label)
+    if match:
+        base = match.group("base").strip()
+        variant = match.group("variant").strip()
+    provider = None
+    family = None
+    parts = base.split(None, 1)
+    if parts:
+        provider = parts[0].strip() or None
+    if len(parts) > 1:
+        family = parts[1].strip() or None
+    return {
+        "name": label,
+        "provider": provider,
+        "family": family,
+        "variant": variant,
+    }
 
 
 def default_root() -> Path:
@@ -578,6 +604,138 @@ def _resolve_usage_refresh_target(paths: ManagerPaths, state: dict, name: str | 
     return account_name, account_dir(paths, account_name)
 
 
+def _run_agy_models_command(
+    runtime_home: Path,
+    agy_binary: str | None = None,
+    timeout_seconds: int = 30,
+) -> list[dict]:
+    resolved_binary = resolve_agy_binary(agy_binary)
+    env = os.environ.copy()
+    env["HOME"] = str(runtime_home)
+    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    proc = subprocess.run(
+        [resolved_binary, "models"],
+        cwd=runtime_home,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=max(10, timeout_seconds),
+        check=False,
+    )
+    output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
+    if proc.returncode != 0:
+        tail = "\n".join(output.splitlines()[-8:]) if output else "no output"
+        raise ValueError(f"agy models failed with exit code {proc.returncode}: {tail}")
+    models: list[dict] = []
+    for line in output.splitlines():
+        parsed = _parse_model_label(line)
+        if parsed:
+            models.append(parsed)
+    if not models:
+        raise ValueError("agy models returned no usable model entries.")
+    return models
+
+
+def _account_due_for_refresh(meta: dict, now: datetime | None = None) -> bool:
+    current = now or utc_now()
+    if not isinstance(meta, dict):
+        return False
+    if not meta.get("enabled", True):
+        return False
+    status = meta.get("status") or "standby"
+    if status in {"disabled", "cooldown"}:
+        return False
+    next_check = parse_timestamp(meta.get("next_live_check_at"))
+    if next_check is not None:
+        return next_check <= current
+    policy = int(meta.get("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS) or DEFAULT_REFRESH_POLICY_SECONDS)
+    if policy <= 0:
+        return False
+    last_check = parse_timestamp(meta.get("last_live_check_at"))
+    if last_check is None:
+        return True
+    return last_check + timedelta(seconds=policy) <= current
+
+
+def pick_due_refresh_account(paths: ManagerPaths) -> str | None:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        now = utc_now()
+        active_name = state.get("active")
+        if active_name:
+            active_meta = state["accounts"].get(active_name)
+            if isinstance(active_meta, dict) and _account_due_for_refresh(active_meta, now):
+                return active_name
+        for name, meta in sorted(state["accounts"].items()):
+            if name == active_name:
+                continue
+            if _account_due_for_refresh(meta, now):
+                return name
+    return None
+
+
+def refresh_due_account(
+    paths: ManagerPaths,
+    *,
+    agy_binary: str | None = None,
+    warmup_timeout_seconds: int = 45,
+) -> UsageRefreshResult | None:
+    target = pick_due_refresh_account(paths)
+    if target is None:
+        return None
+    return refresh_account_usage(
+        paths,
+        target,
+        agy_binary=agy_binary,
+        warmup_timeout_seconds=warmup_timeout_seconds,
+    )
+
+
+def list_models(
+    paths: ManagerPaths,
+    name: str | None = None,
+    *,
+    agy_binary: str | None = None,
+    timeout_seconds: int = 30,
+) -> dict:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        account_name, source_home = _resolve_usage_refresh_target(paths, state, name)
+        live_dir = get_live_dir(state)
+    runtime_home = resolve_runtime_home(live_dir)
+    if not profile_has_login_artifacts(_resolve_profile_source(source_home)):
+        fallback_home = account_dir(paths, account_name)
+        if name is None and profile_has_login_artifacts(_resolve_profile_source(fallback_home)):
+            source_home = fallback_home
+        else:
+            raise ValueError(f"Profile source is missing required auth files: {_resolve_profile_source(source_home)}")
+
+    if name is None:
+        models = _run_agy_models_command(source_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
+        return {
+            "account": account_name,
+            "source_home": str(source_home),
+            "models": models,
+            "count": len(models),
+        }
+
+    with tempfile.TemporaryDirectory(prefix="agy-models-restore-") as restore_root_str:
+        restore_root = Path(restore_root_str)
+        restore_home = restore_root / "home"
+        _copy_managed_home_snapshot(runtime_home, restore_home)
+        try:
+            _copy_managed_home_snapshot(source_home, runtime_home)
+            models = _run_agy_models_command(runtime_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
+        finally:
+            _copy_managed_home_snapshot(restore_home, runtime_home)
+    return {
+        "account": account_name,
+        "source_home": str(source_home),
+        "models": models,
+        "count": len(models),
+    }
+
+
 def _persist_refresh_failure(paths: ManagerPaths, account_name: str, error: str) -> None:
     failed_at = utc_now()
     with manager_lock(paths):
@@ -839,9 +997,80 @@ def _identity_from_antigravity_token(token_state: dict) -> dict | None:
     return None
 
 
+def _iter_antigravity_log_files(home_root: Path) -> list[Path]:
+    base_dir = home_root / ".gemini" / "antigravity-cli"
+    candidates: list[Path] = []
+    cli_log = base_dir / "cli.log"
+    if cli_log.is_file():
+        candidates.append(cli_log)
+    log_dir = base_dir / "log"
+    if log_dir.is_dir():
+        try:
+            log_files = sorted(
+                (path for path in log_dir.iterdir() if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            log_files = []
+        candidates.extend(log_files)
+    return candidates
+
+
+def _identity_from_antigravity_logs(source_dir: Path) -> dict | None:
+    home_root = _resolve_home_source(source_dir)
+    for path in _iter_antigravity_log_files(home_root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in reversed(text.splitlines()):
+            match = APPLY_AUTH_EMAIL_PATTERN.search(line)
+            if match:
+                email = match.group(1).strip()
+                if email:
+                    return {
+                        "account_name": email,
+                        "email": email,
+                        "source": f"antigravity-cli.log:{path.name}",
+                    }
+            if "Cache(userInfo)" in line:
+                match = EMAIL_PATTERN.search(line)
+                if match:
+                    email = match.group(0).strip()
+                    if email:
+                        return {
+                            "account_name": email,
+                            "email": email,
+                            "source": f"antigravity-cli.log:{path.name}",
+                        }
+    return None
+
+
 def _best_effort_live_identity(access_token: str) -> dict | None:
     userinfo = _google_userinfo_request(access_token)
     return _identity_from_payload(userinfo, "google_userinfo")
+
+
+def _best_effort_saved_profile_identity(source_dir: Path) -> dict:
+    identity = detect_profile_identity(source_dir)
+    if identity.get("account_name"):
+        return identity
+    log_identity = _identity_from_antigravity_logs(source_dir)
+    if log_identity:
+        return log_identity
+    home_source = _resolve_home_source(source_dir)
+    try:
+        access_token = _extract_access_token(home_source)
+    except ValueError:
+        return identity
+    if not isinstance(access_token, str) or not access_token.strip():
+        return identity
+    try:
+        live_identity = _best_effort_live_identity(access_token.strip())
+    except (PermissionError, ValueError):
+        return identity
+    return live_identity or identity
 
 
 def detect_profile_identity(source_dir: Path) -> dict:
@@ -876,6 +1105,9 @@ def detect_profile_identity(source_dir: Path) -> dict:
         identity = _identity_from_antigravity_token(token_state)
         if identity:
             return identity
+    identity = _identity_from_antigravity_logs(source_dir)
+    if identity:
+        return identity
 
     return {
         "account_name": None,
@@ -908,7 +1140,18 @@ def _update_account_identity(state: dict, name: str, identity: dict) -> None:
 
 
 def refresh_account_identity(paths: ManagerPaths, name: str) -> dict:
-    identity = detect_profile_identity(account_dir(paths, name))
+    identity = _best_effort_saved_profile_identity(account_dir(paths, name))
+    if not identity.get("account_name"):
+        try:
+            live_dir = get_live_dir(load_state(paths))
+            probe = probe_profile_identity_via_usage(
+                account_dir(paths, name),
+                live_dir=live_dir,
+            )
+            if probe.get("account_name"):
+                identity = probe
+        except (ValueError, subprocess.TimeoutExpired):
+            pass
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         if name not in state["accounts"]:
@@ -989,7 +1232,7 @@ def resolve_login_profile_identity(
     agy_binary: str | None = None,
     live_dir: Path | None = None,
 ) -> dict:
-    identity = detect_profile_identity(source_dir)
+    identity = _best_effort_saved_profile_identity(source_dir)
     if identity.get("account_name"):
         return identity
     try:
