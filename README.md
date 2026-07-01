@@ -149,6 +149,11 @@ agy-cli-manager switch-next
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
 ```
 
+The current switch policy is stored in manager state and can be controlled by either:
+
+- CLI: `switch-mode`, `switch-policy`, `ensure-active`
+- Python API: `get_status_snapshot()`, `get_switch_policy()`, `update_switch_policy()`, `ensure_active_account()`
+
 Directory layout:
 
 ```text
@@ -248,6 +253,7 @@ agy-cli-manager current --json
 agy-cli-manager list --json
 agy-cli-manager ensure-active --json
 agy-cli-manager switch-policy --json
+agy-cli-manager switch-policy --short-threshold 12.5 --refresh-failure-threshold 3 --candidate-strategy highest-short --json
 agy-cli-manager refresh-usage account1 --json
 agy-cli-manager refresh-due --json
 agy-cli-manager models --json
@@ -286,7 +292,7 @@ Notes:
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
 - `models` runs `agy models` for the active account or a named saved profile and can return structured JSON for external callers.
 - the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
-- in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to `10%` or lower, auth is expired/missing, or refresh failures reach the built-in threshold.
+- in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to the configured `short_usage_threshold_percent`, auth is expired/missing, or refresh failures reach the configured threshold.
 - when auto-switching, the manager ranks the standby pool and prefers accounts with better health and more remaining short-window quota instead of simply taking the first account by name.
 - the default switch policy is `short_usage_threshold_percent=10`, `refresh_failure_threshold=2`, `candidate_strategy=balanced`.
 - `rotate-after-failure` is the public failover operation for external apps: mark the current active account bad, optionally put it in cooldown, then switch to the next eligible standby account.
@@ -330,6 +336,24 @@ print(snapshot["active"], "->", result.switched_to)
 print(policy)
 print([model["name"] for model in models["models"]])
 ```
+
+Public Python API:
+
+- `build_paths(root)`
+- `ensure_layout(paths)`
+- `get_status_snapshot(paths)`
+- `get_switch_policy(paths)`
+- `update_switch_policy(paths, ...)`
+- `ensure_active_account(paths, force=False)`
+- `list_models(paths, name=None, ...)`
+- `refresh_account_usage(paths, name=None, ...)`
+- `refresh_due_account(paths, ...)`
+- `switch_account(paths, name)`
+- `switch_next(paths)`
+- `rotate_after_failure(paths, reason, cooldown_minutes=60, live_dir=None, force_switch=False)`
+- `set_switch_mode(paths, mode)`
+- `set_live_dir(paths, live_dir)`
+- `update_account_runtime_metadata(paths, name, ...)`
 
 More explicit example:
 
