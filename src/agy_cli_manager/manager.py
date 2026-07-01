@@ -22,23 +22,9 @@ import fcntl
 
 
 MANAGED_PROFILE_FILES = (
-    "oauth_creds.json",
-    "google_account_id",
-    "google_accounts.json",
     "antigravity-cli/antigravity-oauth-token",
-    "antigravity-cli/settings.json",
-)
-MANAGED_HOME_PATHS = (
-    ".gemini",
-    ".config",
-    ".cache",
-    ".local",
-)
-TOKEN_CACHE_FILES = (
-    "mcp-oauth-tokens-v2.json",
 )
 LOGIN_ARTIFACT_SETS = (
-    ("oauth_creds.json",),
     ("antigravity-cli/antigravity-oauth-token",),
 )
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
@@ -276,58 +262,6 @@ def _clear_directory(path: Path) -> None:
             child.unlink(missing_ok=True)
 
 
-def _copy_directory_contents(source: Path, target: Path) -> None:
-    _clear_directory(target)
-    for child in source.iterdir():
-        dst = target / child.name
-        if child.is_dir() and not child.is_symlink():
-            shutil.copytree(child, dst, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, dst)
-
-
-def _remove_managed_home_paths(home_root: Path) -> None:
-    home_root.mkdir(parents=True, exist_ok=True)
-    for rel in MANAGED_HOME_PATHS:
-        path = home_root / rel
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            path.unlink(missing_ok=True)
-
-
-def _copy_managed_home_snapshot(source_home: Path, target_home: Path) -> None:
-    _remove_managed_home_paths(target_home)
-    target_home.mkdir(parents=True, exist_ok=True)
-    copied_any = False
-    for rel in MANAGED_HOME_PATHS:
-        src = source_home / rel
-        dst = target_home / rel
-        if src.is_dir() and not src.is_symlink():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-            copied_any = True
-        elif src.is_file():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            copied_any = True
-
-    if copied_any:
-        return
-
-    profile_source = _resolve_profile_source(source_home)
-    if not profile_has_login_artifacts(profile_source):
-        return
-
-    target_profile = target_home / ".gemini"
-    _copy_managed_profile_files(profile_source, target_profile)
-    for name in TOKEN_CACHE_FILES:
-        src = profile_source / name
-        dst = target_profile / name
-        if src.is_file():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-
-
 def resolve_agy_binary(agy_binary: str | None = None) -> str:
     if agy_binary and agy_binary.strip():
         return agy_binary.strip()
@@ -363,8 +297,14 @@ def _copy_managed_profile_files(source: Path, target: Path) -> None:
 
 def _remove_managed_profile_files(target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    for name in MANAGED_PROFILE_FILES + TOKEN_CACHE_FILES:
+    for name in MANAGED_PROFILE_FILES:
         (target / name).unlink(missing_ok=True)
+
+
+def _copy_account_profile(source_dir: Path, target_home: Path) -> None:
+    profile_source = _resolve_profile_source(source_dir)
+    target_profile = target_home / ".gemini"
+    _copy_managed_profile_files(profile_source, target_profile)
 
 
 def _resolve_profile_source(source_dir: Path) -> Path:
@@ -1074,12 +1014,12 @@ def list_models(
     with tempfile.TemporaryDirectory(prefix="agy-models-restore-") as restore_root_str:
         restore_root = Path(restore_root_str)
         restore_home = restore_root / "home"
-        _copy_managed_home_snapshot(runtime_home, restore_home)
+        _copy_account_profile(runtime_home, restore_home)
         try:
-            _copy_managed_home_snapshot(source_home, runtime_home)
+            _copy_account_profile(source_home, runtime_home)
             models = _run_agy_models_command(runtime_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
         finally:
-            _copy_managed_home_snapshot(restore_home, runtime_home)
+            _copy_account_profile(restore_home, runtime_home)
     return {
         "account": account_name,
         "source_home": str(source_home),
@@ -1427,7 +1367,7 @@ def _best_effort_saved_profile_identity(source_dir: Path) -> dict:
         return identity
     try:
         live_identity = _best_effort_live_identity(access_token.strip())
-    except (PermissionError, ValueError):
+    except (PermissionError, ValueError, urllib.error.URLError):
         return identity
     return live_identity or identity
 
@@ -1549,9 +1489,9 @@ def probe_profile_identity_via_usage(
     with tempfile.TemporaryDirectory(prefix="agy-usage-restore-") as restore_root_str:
         restore_root = Path(restore_root_str)
         restore_home = restore_root / "home"
-        _copy_managed_home_snapshot(runtime_home, restore_home)
+        _copy_account_profile(runtime_home, restore_home)
         try:
-            _copy_managed_home_snapshot(source_home, runtime_home)
+            _copy_account_profile(source_home, runtime_home)
 
             env = os.environ.copy()
             env["HOME"] = str(runtime_home)
@@ -1583,7 +1523,7 @@ def probe_profile_identity_via_usage(
                 "raw_hint": "\n".join(output.splitlines()[:8]),
             }
         finally:
-            _copy_managed_home_snapshot(restore_home, runtime_home)
+            _copy_account_profile(restore_home, runtime_home)
 
 
 def resolve_login_profile_identity(
@@ -1722,11 +1662,12 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     target_exists = target.exists()
     if target_exists and not overwrite:
         raise ValueError(f"Account already exists: {name}")
-    if not target_exists:
+    if target_exists:
+        _clear_directory(target)
+    else:
         target.mkdir(parents=True, exist_ok=False)
-
-    _copy_managed_home_snapshot(home_source, target)
-    identity = detect_profile_identity(target)
+    _copy_account_profile(home_source, target)
+    identity = _best_effort_saved_profile_identity(target)
 
     with manager_lock(paths):
         state = load_state(paths)
@@ -1785,23 +1726,15 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
     if not profile_has_login_artifacts(_resolve_profile_source(src)):
         raise ValueError(f"Account {name} is missing required auth files")
 
-    _clear_directory(paths.runtime_dir)
-    _copy_managed_home_snapshot(src, paths.runtime_dir)
-    for cache_name in TOKEN_CACHE_FILES:
-        cache_file = paths.runtime_dir / cache_name
-        if cache_file.exists():
-            cache_file.unlink()
+    paths.runtime_dir.mkdir(parents=True, exist_ok=True)
+    _copy_account_profile(src, paths.runtime_dir)
 
 
 def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
     live_dir = get_live_dir(state)
     if live_dir is None:
         return
-    _copy_managed_home_snapshot(paths.runtime_dir, live_dir.parent)
-    for cache_name in TOKEN_CACHE_FILES:
-        cache_file = live_dir / cache_name
-        if cache_file.exists():
-            cache_file.unlink()
+    _copy_account_profile(paths.runtime_dir, live_dir.parent)
 
 
 def switch_account(paths: ManagerPaths, name: str) -> str:
@@ -2150,7 +2083,7 @@ def login_account(
 
     runtime_home = live_dir.parent
     runtime_home.mkdir(parents=True, exist_ok=True)
-    _remove_managed_home_paths(runtime_home)
+    _remove_managed_profile_files(live_dir)
 
     env = os.environ.copy()
     env["HOME"] = str(runtime_home)
