@@ -1,6 +1,16 @@
 # agy-cli-manager
 
-`agy-cli-manager` is an active-standby account manager for Antigravity CLI (`agy`).
+`agy-cli-manager` is a Python account manager for Antigravity CLI (`agy`) with active-standby failover, quota-aware switching, and machine-readable automation APIs.
+
+It helps you run multiple Antigravity CLI accounts more safely by:
+
+- switching away from low-quota or failed accounts
+- keeping a managed runtime home in sync with the active profile
+- exposing CLI and Python APIs for bots, schedulers, and external apps
+- supporting manual or automatic account rotation policies
+
+Keywords:
+Antigravity CLI account manager, agy multi account manager, agy failover, agy quota switching, Gemini CLI account rotation.
 
 It is designed for one active account at a time:
 
@@ -12,6 +22,12 @@ It is designed for one active account at a time:
 It is application-agnostic. A Telegram bot can call it, but the manager itself is not Telegram-specific.
 
 ![Sanitized dashboard example](docs/dashboard-screenshot.svg)
+
+Project links:
+
+- Repo: `https://github.com/zcop/agy-cli-manager`
+- Release wheel: `https://github.com/zcop/agy-cli-manager/releases`
+- GitHub Pages site: `https://zcop.github.io/agy-cli-manager/`
 
 ## What it does
 
