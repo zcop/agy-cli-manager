@@ -452,6 +452,13 @@ def _extract_access_token(home_root: Path) -> str:
     return access_token.strip()
 
 
+def _has_refresh_token(home_root: Path) -> bool:
+    data = _load_antigravity_token_state(home_root)
+    token = data.get("token")
+    refresh_token = token.get("refresh_token") if isinstance(token, dict) else None
+    return isinstance(refresh_token, str) and bool(refresh_token.strip())
+
+
 def _token_expiry_due(home_root: Path, skew_seconds: int = 120) -> bool:
     data = _load_antigravity_token_state(home_root)
     token = data.get("token")
@@ -1569,7 +1576,9 @@ def _derive_health_status(paths: ManagerPaths, name: str, meta: dict) -> str:
         source_home = _resolve_home_source(account_path)
         _extract_access_token(source_home)
         if _token_expiry_due(source_home):
-            return "auth_expired"
+            if not _has_refresh_token(source_home):
+                return "auth_expired"
+            return "stale"
     except ValueError:
         pass
     if meta.get("last_live_check_error"):
