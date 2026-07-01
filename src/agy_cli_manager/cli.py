@@ -17,6 +17,7 @@ from agy_cli_manager.manager import (
     build_paths,
     clear_bad,
     default_root,
+    ensure_active_account,
     ensure_layout,
     format_status,
     get_account_identity,
@@ -35,8 +36,10 @@ from agy_cli_manager.manager import (
     rotate_after_failure,
     set_live_dir,
     set_enabled,
+    set_switch_mode,
     switch_account,
     switch_next,
+    update_switch_policy,
     update_account_runtime_metadata,
 )
 
@@ -56,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd = sub.add_parser("list", help="List saved accounts")
     list_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     sub.add_parser("apply-active", help="Re-apply the current active account to runtime and live_dir")
+    ensure_cmd = sub.add_parser("ensure-active", help="Evaluate switch policy and ensure there is a usable active account")
+    ensure_cmd.add_argument("--force", action="store_true", help="Apply the policy even when switch mode is manual")
+    ensure_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    switch_mode = sub.add_parser("switch-mode", help="Show or set account switching mode")
+    switch_mode.add_argument("mode", nargs="?", choices=("auto", "manual"))
+    switch_mode.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    switch_policy = sub.add_parser("switch-policy", help="Show or update account switching policy")
+    switch_policy.add_argument("--short-threshold", type=float, dest="short_threshold")
+    switch_policy.add_argument("--refresh-failure-threshold", type=int, dest="refresh_failure_threshold")
+    switch_policy.add_argument("--candidate-strategy", choices=("balanced", "highest-short", "round-robin"))
+    switch_policy.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     refresh_usage = sub.add_parser("refresh-usage", help="Fetch real Cloud Code quota and persist cached usage metadata")
     refresh_usage.add_argument("name", nargs="?")
     refresh_usage.add_argument("--agy-binary")
@@ -120,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument("--reason", default="manual")
     rotate.add_argument("--cooldown-minutes", type=int, default=60)
     rotate.add_argument("--live-dir")
+    rotate.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
     rotate.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     update_meta = sub.add_parser("update-meta", help="Update cached runtime metadata for an account")
@@ -196,6 +211,9 @@ def run_menu(paths, parser: argparse.ArgumentParser) -> int:
         print("9. Mark account bad")
         print("10. Clear account bad state")
         print("11. Show account identity")
+        print("12. Set switch mode")
+        print("13. Ensure active")
+        print("14. Set switch policy")
         print("0. Exit")
 
         choice = input("Select: ").strip()
@@ -252,6 +270,38 @@ def run_menu(paths, parser: argparse.ArgumentParser) -> int:
                 print(f"account: {resolved_name}")
                 print(f"account_name: {identity.get('account_name') or '-'}")
                 print(f"source: {identity.get('source') or '-'}")
+            elif choice == "12":
+                mode = prompt_nonempty("Switch mode [auto/manual]").strip().lower()
+                current_mode = set_switch_mode(paths, mode)
+                print(f"switch-mode: {current_mode}")
+            elif choice == "13":
+                result = ensure_active_account(paths)
+                print(
+                    json.dumps(
+                        {
+                            "triggered": result.triggered,
+                            "switch_mode": result.switch_mode,
+                            "previous_active": result.previous_active,
+                            "active": result.active,
+                            "switched_to": result.switched_to,
+                            "reason": result.reason,
+                            "cooldown_minutes": result.cooldown_minutes,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            elif choice == "14":
+                short_raw = input("Short threshold percent [skip]: ").strip()
+                failure_raw = input("Refresh failure threshold [skip]: ").strip()
+                strategy_raw = input("Candidate strategy [balanced/highest-short/round-robin, skip]: ").strip()
+                policy = update_switch_policy(
+                    paths,
+                    short_usage_threshold_percent=float(short_raw) if short_raw else None,
+                    refresh_failure_threshold=int(failure_raw) if failure_raw else None,
+                    candidate_strategy=strategy_raw or None,
+                )
+                print(json.dumps(policy, indent=2, sort_keys=True))
             elif choice == "0":
                 return 0
             else:
@@ -544,6 +594,7 @@ def _draw_action_bar(stdscr, y: int) -> int:
         ("E", "Enable/Disable"),
         ("C", "ClearBad"),
         ("M", "MarkBad"),
+        ("W", "Mode"),
         ("S", "Sort"),
         ("U", "Live Usage Refresh"),
         ("T", "UI Refresh"),
@@ -955,6 +1006,7 @@ def _dashboard(stdscr, paths) -> int:
             f" | Accounts: {len(accounts)}"
             f" | UI Refresh: {interval}s"
             f" | Sort: {sort_mode_name}"
+            f" | Switch: {snapshot.get('switch_mode') or 'auto'}"
             " | Live Status: Auto+Manual"
         )
         top_lines = _draw_wrapped_lines(stdscr, 0, top, _color_attr(COLOR_HEADER, curses.A_BOLD))
@@ -1035,6 +1087,7 @@ def _dashboard(stdscr, paths) -> int:
                 ("Live Error", selected_meta.get('last_live_check_error') or '-', _detail_value_attr(selected_meta, "Last Live Error", now_dt)),
                 ("Last Error", _format_last_error(selected_meta), _detail_value_attr(selected_meta, "Last Error", now_dt)),
                 ("Policy", "auto on due + manual refresh", _severity_attr("info")),
+                ("Switching", snapshot.get("switch_mode") or "auto", _severity_attr("info")),
             ]
         else:
             overview_rows = [
@@ -1141,6 +1194,10 @@ def _dashboard(stdscr, paths) -> int:
             elif key in (ord("r"), ord("R")):
                 target = switch_next(paths)
                 message = f"Rotated to {target}."
+            elif key in (ord("w"), ord("W")):
+                next_mode = "manual" if (snapshot.get("switch_mode") or "auto") == "auto" else "auto"
+                set_switch_mode(paths, next_mode)
+                message = f"Switch mode set to {next_mode}."
             elif key in (ord("e"), ord("E")):
                 enabled = bool(selected_meta.get("enabled", True))
                 set_enabled(paths, selected_name, not enabled)
@@ -1182,6 +1239,7 @@ def print_account_list(paths, as_json: bool) -> None:
                 "last_error": meta.get("last_error"),
                 "cooldown_until": meta.get("cooldown_until"),
                 "fail_count": int(meta.get("fail_count", 0) or 0),
+                "refresh_fail_count": int(meta.get("refresh_fail_count", 0) or 0),
             }
         )
     if as_json:
@@ -1271,6 +1329,68 @@ def main() -> int:
         if args.command == "apply-active":
             active = apply_active(paths)
             print(f"applied-active: {active}")
+            return 0
+        if args.command == "ensure-active":
+            result = ensure_active_account(paths, force=args.force)
+            payload = {
+                "triggered": result.triggered,
+                "switch_mode": result.switch_mode,
+                "previous_active": result.previous_active,
+                "active": result.active,
+                "switched_to": result.switched_to,
+                "reason": result.reason,
+                "cooldown_minutes": result.cooldown_minutes,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                if result.switched_to and result.previous_active:
+                    print(f"ensured-active: {result.previous_active} -> {result.switched_to} ({result.reason})")
+                elif result.switched_to:
+                    print(f"ensured-active: {result.switched_to} ({result.reason})")
+                elif result.active and not result.triggered:
+                    print(f"active-ok: {result.active}")
+                elif result.reason:
+                    print(f"ensure-active: {result.reason}")
+                else:
+                    print("ensure-active: no action")
+            return 0
+        if args.command == "switch-mode":
+            snapshot = get_status_snapshot(paths)
+            if args.mode is None:
+                payload = {"switch_mode": snapshot.get("switch_mode", "auto")}
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(payload["switch_mode"])
+                return 0
+            mode = set_switch_mode(paths, args.mode)
+            payload = {"switch_mode": mode}
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(f"switch-mode: {mode}")
+            return 0
+        if args.command == "switch-policy":
+            snapshot = get_status_snapshot(paths)
+            no_updates = (
+                args.short_threshold is None
+                and args.refresh_failure_threshold is None
+                and args.candidate_strategy is None
+            )
+            if no_updates:
+                payload = snapshot.get("switch_policy", {})
+            else:
+                payload = update_switch_policy(
+                    paths,
+                    short_usage_threshold_percent=args.short_threshold,
+                    refresh_failure_threshold=args.refresh_failure_threshold,
+                    candidate_strategy=args.candidate_strategy,
+                )
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(json.dumps(payload, indent=2, sort_keys=True))
             return 0
         if args.command == "refresh-usage":
             result = refresh_account_usage(
@@ -1423,6 +1543,7 @@ def main() -> int:
                 reason=args.reason,
                 cooldown_minutes=args.cooldown_minutes,
                 live_dir=live_dir,
+                force_switch=args.force_switch,
             )
             if args.json:
                 print(json.dumps({
@@ -1432,10 +1553,13 @@ def main() -> int:
                     "marked_bad": result.marked_bad,
                     "reason": result.reason,
                     "cooldown_minutes": result.cooldown_minutes,
+                    "switch_mode": get_status_snapshot(paths).get("switch_mode", "auto"),
                 }, indent=2, sort_keys=True))
             else:
                 if result.previous_active and result.switched_to:
                     print(f"rotated: {result.previous_active} -> {result.switched_to}")
+                elif result.previous_active and get_status_snapshot(paths).get("switch_mode", "auto") == "manual":
+                    print(f"marked-bad-manual-mode: {result.previous_active}")
                 elif result.previous_active:
                     print(f"marked-bad-no-standby: {result.previous_active}")
                 else:

@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -44,6 +45,12 @@ EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNO
 APPLY_AUTH_EMAIL_PATTERN = re.compile(r"applyAuthResult:\s+email=([^,\s]+)", re.IGNORECASE)
 DEFAULT_REFRESH_POLICY_SECONDS = 1800
 USAGE_WINDOW_NAMES = ("short", "weekly")
+DEFAULT_SWITCH_MODE = "auto"
+VALID_SWITCH_MODES = ("auto", "manual")
+DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD = 2
+DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT = 10.0
+DEFAULT_CANDIDATE_STRATEGY = "balanced"
+VALID_CANDIDATE_STRATEGIES = ("balanced", "highest-short", "round-robin")
 CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com"
 CODE_ASSIST_USER_AGENT = "antigravity"
 CODE_ASSIST_LOAD_PATH = "/v1internal:loadCodeAssist"
@@ -86,6 +93,17 @@ class UsageRefreshResult:
     weekly_usage_value: float | None
     weekly_reset_at: str | None
     bucket_count: int
+
+
+@dataclass
+class EnsureActiveResult:
+    triggered: bool
+    switch_mode: str
+    previous_active: str | None
+    active: str | None
+    switched_to: str | None
+    reason: str | None
+    cooldown_minutes: int
 
 
 def _parse_model_label(value: str) -> dict | None:
@@ -139,7 +157,16 @@ def ensure_layout(paths: ManagerPaths) -> None:
     paths.accounts_dir.mkdir(parents=True, exist_ok=True)
     paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     if not paths.state_file.exists():
-        save_state(paths, {"active": None, "accounts": {}, "live_dir": str(default_live_dir())})
+        save_state(
+            paths,
+            {
+                "active": None,
+                "accounts": {},
+                "live_dir": str(default_live_dir()),
+                "switch_mode": DEFAULT_SWITCH_MODE,
+                "switch_policy": _default_switch_policy(),
+            },
+        )
 
 
 @contextmanager
@@ -168,6 +195,8 @@ def load_state(paths: ManagerPaths) -> dict:
     data.setdefault("active", None)
     data.setdefault("accounts", {})
     data.setdefault("live_dir", str(default_live_dir()))
+    data["switch_mode"] = _normalize_switch_mode(data.get("switch_mode"))
+    data["switch_policy"] = _normalize_switch_policy(data.get("switch_policy"))
     if data.get("live_dir") is None:
         data["live_dir"] = str(default_live_dir())
     return data
@@ -176,6 +205,62 @@ def load_state(paths: ManagerPaths) -> dict:
 def save_state(paths: ManagerPaths, state: dict) -> None:
     with paths.state_file.open("w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
+
+
+def _normalize_switch_mode(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_SWITCH_MODES:
+            return normalized
+    return DEFAULT_SWITCH_MODE
+
+
+def get_switch_mode(state: dict) -> str:
+    return _normalize_switch_mode(state.get("switch_mode"))
+
+
+def _default_switch_policy() -> dict:
+    return {
+        "short_usage_threshold_percent": DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT,
+        "refresh_failure_threshold": DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD,
+        "candidate_strategy": DEFAULT_CANDIDATE_STRATEGY,
+    }
+
+
+def _normalize_candidate_strategy(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_CANDIDATE_STRATEGIES:
+            return normalized
+    return DEFAULT_CANDIDATE_STRATEGY
+
+
+def _normalize_switch_policy(raw: object) -> dict:
+    defaults = _default_switch_policy()
+    policy = dict(defaults)
+    if isinstance(raw, dict):
+        threshold = raw.get("short_usage_threshold_percent")
+        try:
+            if threshold is not None:
+                threshold_value = float(threshold)
+                if 0.0 <= threshold_value <= 100.0:
+                    policy["short_usage_threshold_percent"] = threshold_value
+        except (TypeError, ValueError):
+            pass
+        failure_threshold = raw.get("refresh_failure_threshold")
+        try:
+            if failure_threshold is not None:
+                failure_value = int(failure_threshold)
+                if failure_value >= 1:
+                    policy["refresh_failure_threshold"] = failure_value
+        except (TypeError, ValueError):
+            pass
+        policy["candidate_strategy"] = _normalize_candidate_strategy(raw.get("candidate_strategy"))
+    return policy
+
+
+def _state_switch_policy(state: dict) -> dict:
+    return _normalize_switch_policy(state.get("switch_policy"))
 
 
 def account_dir(paths: ManagerPaths, name: str) -> Path:
@@ -657,6 +742,144 @@ def _account_due_for_refresh(meta: dict, now: datetime | None = None) -> bool:
     return last_check + timedelta(seconds=policy) <= current
 
 
+def _eligible_switch_candidates(state: dict, exclude: str | None = None) -> list[str]:
+    return [
+        name
+        for name, meta in sorted(state["accounts"].items())
+        if name != exclude
+        and meta.get("enabled", True)
+        and meta.get("status") != "cooldown"
+    ]
+
+
+def _is_short_window_exhausted(meta: dict, now: datetime | None = None, *, threshold_percent: float = DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT) -> bool:
+    current = now or utc_now()
+    windows = _normalize_usage_windows(meta)
+    short = windows.get("short", {})
+    if short.get("status") != "known":
+        return False
+    value = _coerce_usage_value(short.get("value"))
+    if value is None or value > threshold_percent:
+        return False
+    reset_at = parse_timestamp(short.get("reset_at"))
+    if reset_at is not None and reset_at <= current:
+        return False
+    return True
+
+
+def _cooldown_minutes_from_short_window(meta: dict, now: datetime | None = None) -> int:
+    current = now or utc_now()
+    windows = _normalize_usage_windows(meta)
+    short = windows.get("short", {})
+    reset_at = parse_timestamp(short.get("reset_at"))
+    if reset_at is None or reset_at <= current:
+        return 60
+    delta_seconds = max(60.0, (reset_at - current).total_seconds())
+    return max(1, int(math.ceil(delta_seconds / 60.0)))
+
+
+def _refresh_failure_threshold_reached(meta: dict, threshold: int = DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD) -> bool:
+    return int(meta.get("refresh_fail_count", 0) or 0) >= threshold
+
+
+def _coerce_usage_value(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def _candidate_usage_value(meta: dict, window_name: str) -> float | None:
+    windows = _normalize_usage_windows(meta)
+    window = windows.get(window_name, {})
+    if not isinstance(window, dict):
+        return None
+    return _coerce_usage_value(window.get("value"))
+
+
+def _candidate_health_priority(health: str) -> int:
+    order = {
+        "healthy": 0,
+        "ready": 1,
+        "stale": 2,
+        "refresh_failed": 3,
+        "auth_expired": 4,
+        "auth_missing": 5,
+        "cooldown": 6,
+        "disabled": 7,
+    }
+    return order.get(health, 8)
+
+
+def _best_switch_candidate(paths: ManagerPaths, state: dict, *, exclude: str | None = None) -> str | None:
+    policy = _state_switch_policy(state)
+    strategy = policy["candidate_strategy"]
+    threshold_percent = float(policy["short_usage_threshold_percent"])
+    candidates = _eligible_switch_candidates(state, exclude=exclude)
+    if not candidates:
+        return None
+
+    ranked: list[tuple[tuple[object, ...], str]] = []
+    for name in candidates:
+        meta = state["accounts"].get(name)
+        if not isinstance(meta, dict):
+            continue
+        health = _derive_health_status(paths, name, meta)
+        if health in {"auth_missing", "auth_expired", "disabled", "cooldown"}:
+            continue
+
+        short_value = _candidate_usage_value(meta, "short")
+        weekly_value = _candidate_usage_value(meta, "weekly")
+        short_known = short_value is not None
+        short_low = short_known and short_value <= threshold_percent
+        weekly_known = weekly_value is not None
+
+        if strategy == "highest-short":
+            score = (
+                0 if short_known else 1,
+                -(short_value if short_value is not None else -1.0),
+                _candidate_health_priority(health),
+                int(meta.get("refresh_fail_count", 0) or 0),
+                int(meta.get("fail_count", 0) or 0),
+                str(meta.get("created_at") or ""),
+                name.lower(),
+            )
+        elif strategy == "round-robin":
+            score = (
+                _candidate_health_priority(health),
+                0 if short_known and not short_low else 1,
+                str(meta.get("created_at") or ""),
+                name.lower(),
+            )
+        else:
+            score = (
+                _candidate_health_priority(health),
+                0 if short_known and not short_low else 1,
+                0 if short_known else 1,
+                -(short_value if short_value is not None else -1.0),
+                0 if weekly_known else 1,
+                -(weekly_value if weekly_value is not None else -1.0),
+                int(meta.get("refresh_fail_count", 0) or 0),
+                int(meta.get("fail_count", 0) or 0),
+                str(meta.get("created_at") or ""),
+                name.lower(),
+            )
+        ranked.append((score, name))
+
+    if not ranked:
+        return candidates[0]
+
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
 def pick_due_refresh_account(paths: ManagerPaths) -> str | None:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
@@ -674,12 +897,141 @@ def pick_due_refresh_account(paths: ManagerPaths) -> str | None:
     return None
 
 
+def ensure_active_account(paths: ManagerPaths, *, force: bool = False) -> EnsureActiveResult:
+    snapshot = get_status_snapshot(paths)
+    switch_mode = snapshot.get("switch_mode", DEFAULT_SWITCH_MODE)
+    switch_policy = snapshot.get("switch_policy") or _default_switch_policy()
+    active_name = snapshot.get("active")
+    accounts = snapshot.get("accounts", {})
+    now = utc_now()
+
+    if switch_mode != "auto" and not force:
+        return EnsureActiveResult(
+            triggered=False,
+            switch_mode=switch_mode,
+            previous_active=active_name,
+            active=active_name,
+            switched_to=None,
+            reason=None,
+            cooldown_minutes=0,
+        )
+
+    if not active_name:
+        with manager_lock(paths):
+            state = sync_state_from_disk(paths, load_state(paths))
+            switched_to = _best_switch_candidate(paths, state)
+            if switched_to:
+                _copy_active_runtime(paths, switched_to)
+                state["active"] = switched_to
+                state = sync_state_from_disk(paths, state)
+                _sync_runtime_to_live_dir(paths, state)
+                save_state(paths, state)
+        if not switched_to:
+            return EnsureActiveResult(
+                triggered=False,
+                switch_mode=switch_mode,
+                previous_active=None,
+                active=None,
+                switched_to=None,
+                reason="no_active_account",
+                cooldown_minutes=0,
+            )
+        return EnsureActiveResult(
+            triggered=True,
+            switch_mode=switch_mode,
+            previous_active=None,
+            active=switched_to,
+            switched_to=switched_to,
+            reason="no_active_account",
+            cooldown_minutes=0,
+        )
+
+    active_meta = accounts.get(active_name)
+    if not isinstance(active_meta, dict):
+        with manager_lock(paths):
+            state = sync_state_from_disk(paths, load_state(paths))
+            switched_to = _best_switch_candidate(paths, state, exclude=active_name)
+            if switched_to:
+                _copy_active_runtime(paths, switched_to)
+                state["active"] = switched_to
+                state = sync_state_from_disk(paths, state)
+                _sync_runtime_to_live_dir(paths, state)
+                save_state(paths, state)
+        if not switched_to:
+            return EnsureActiveResult(
+                triggered=False,
+                switch_mode=switch_mode,
+                previous_active=active_name,
+                active=None,
+                switched_to=None,
+                reason="active_missing",
+                cooldown_minutes=0,
+            )
+        return EnsureActiveResult(
+            triggered=True,
+            switch_mode=switch_mode,
+            previous_active=active_name,
+            active=switched_to,
+            switched_to=switched_to,
+            reason="active_missing",
+            cooldown_minutes=0,
+        )
+
+    reason = None
+    cooldown_minutes = 0
+    health = active_meta.get("health_status")
+    if health in {"auth_missing", "auth_expired"}:
+        reason = health
+        cooldown_minutes = 60
+    elif _is_short_window_exhausted(
+        active_meta,
+        now,
+        threshold_percent=float(switch_policy.get("short_usage_threshold_percent", DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT)),
+    ):
+        reason = "quota_exhausted"
+        cooldown_minutes = _cooldown_minutes_from_short_window(active_meta, now)
+    elif _refresh_failure_threshold_reached(
+        active_meta,
+        threshold=int(switch_policy.get("refresh_failure_threshold", DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD)),
+    ):
+        reason = "refresh_failed"
+        cooldown_minutes = 10
+
+    if reason is None:
+        return EnsureActiveResult(
+            triggered=False,
+            switch_mode=switch_mode,
+            previous_active=active_name,
+            active=active_name,
+            switched_to=None,
+            reason=None,
+            cooldown_minutes=0,
+        )
+
+    result = rotate_after_failure(
+        paths,
+        reason=reason,
+        cooldown_minutes=cooldown_minutes,
+        force_switch=True,
+    )
+    return EnsureActiveResult(
+        triggered=bool(result.switched_to or result.previous_active),
+        switch_mode=switch_mode,
+        previous_active=result.previous_active,
+        active=result.active,
+        switched_to=result.switched_to,
+        reason=reason,
+        cooldown_minutes=cooldown_minutes,
+    )
+
+
 def refresh_due_account(
     paths: ManagerPaths,
     *,
     agy_binary: str | None = None,
     warmup_timeout_seconds: int = 45,
 ) -> UsageRefreshResult | None:
+    ensure_active_account(paths)
     target = pick_due_refresh_account(paths)
     if target is None:
         return None
@@ -745,6 +1097,7 @@ def _persist_refresh_failure(paths: ManagerPaths, account_name: str, error: str)
             return
         meta["health_status"] = "refresh_failed"
         meta["last_live_check_error"] = error
+        meta["refresh_fail_count"] = int(meta.get("refresh_fail_count", 0) or 0) + 1
         meta["next_live_check_at"] = _normalize_timestamp(failed_at + timedelta(minutes=5))
         save_state(paths, state)
 
@@ -862,15 +1215,21 @@ def refresh_account_usage(
             meta["health_status"] = "healthy"
             meta["last_live_check_at"] = _normalize_timestamp(refreshed_at)
             meta["last_live_check_error"] = None
+            meta["refresh_fail_count"] = 0
             policy_seconds = int(meta.get("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS) or DEFAULT_REFRESH_POLICY_SECONDS)
             meta["next_live_check_at"] = _normalize_timestamp(refreshed_at + timedelta(seconds=policy_seconds))
             meta["identity"] = refreshed_identity
             _sync_legacy_usage_fields(meta)
             save_state(paths, state)
 
+        ensure_active_account(paths)
         return result
     except Exception as exc:
         _persist_refresh_failure(paths, account_name, str(exc))
+        try:
+            ensure_active_account(paths)
+        except ValueError:
+            pass
         raise
 
 
@@ -1309,6 +1668,7 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
                 "health_status": "unknown",
                 "last_live_check_at": None,
                 "last_live_check_error": None,
+                "refresh_fail_count": 0,
                 "next_live_check_at": None,
                 "refresh_policy_seconds": DEFAULT_REFRESH_POLICY_SECONDS,
             },
@@ -1319,6 +1679,7 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
         meta.setdefault("health_status", "unknown")
         meta.setdefault("last_live_check_at", None)
         meta.setdefault("last_live_check_error", None)
+        meta.setdefault("refresh_fail_count", 0)
         meta.setdefault("next_live_check_at", None)
         meta.setdefault("refresh_policy_seconds", DEFAULT_REFRESH_POLICY_SECONDS)
         _sync_legacy_usage_fields(meta)
@@ -1377,6 +1738,7 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
             "last_error": None if overwrite else previous_meta.get("last_error"),
             "cooldown_until": None if overwrite else previous_meta.get("cooldown_until"),
             "fail_count": 0 if overwrite else previous_meta.get("fail_count", 0),
+            "refresh_fail_count": 0 if overwrite else previous_meta.get("refresh_fail_count", 0),
             "created_at": previous_meta.get("created_at") or utc_now().isoformat(),
             "usage_windows": _normalize_usage_windows(previous_meta),
             "usage_status": previous_meta.get("usage_status", "unknown"),
@@ -1466,20 +1828,16 @@ def switch_account(paths: ManagerPaths, name: str) -> str:
 def switch_next(paths: ManagerPaths) -> str:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
-        candidates = [
-            name
-            for name, meta in sorted(state["accounts"].items())
-            if meta.get("enabled", True) and meta.get("status") != "cooldown"
-        ]
+        candidates = _eligible_switch_candidates(state)
         if not candidates:
             raise ValueError("No enabled non-cooldown accounts available.")
 
         current = state.get("active")
-        if current in candidates:
-            idx = (candidates.index(current) + 1) % len(candidates)
-        else:
-            idx = 0
-        target = candidates[idx]
+        target = _best_switch_candidate(paths, state, exclude=current)
+        if target is None and current in candidates and len(candidates) == 1:
+            target = current
+        if target is None:
+            raise ValueError("No eligible standby account is available.")
         if len(candidates) == 1 and current == target:
             raise ValueError("Only one eligible account is available.")
         _copy_active_runtime(paths, target)
@@ -1501,6 +1859,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
             "last_error": meta.get("last_error"),
             "cooldown_until": meta.get("cooldown_until"),
             "fail_count": int(meta.get("fail_count", 0) or 0),
+            "refresh_fail_count": int(meta.get("refresh_fail_count", 0) or 0),
             "created_at": meta.get("created_at"),
             "usage_windows": _normalize_usage_windows(meta),
             "usage_status": meta.get("usage_status", "unknown"),
@@ -1520,8 +1879,56 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "lock_file": str(paths.lock_file),
         "live_dir": state.get("live_dir"),
         "active": state.get("active"),
+        "switch_mode": get_switch_mode(state),
+        "switch_policy": _state_switch_policy(state),
         "accounts": snapshot_accounts,
     }
+
+
+def get_switch_policy(paths: ManagerPaths) -> dict:
+    state = sync_state_from_disk(paths, load_state(paths))
+    return dict(_state_switch_policy(state))
+
+
+def set_switch_mode(paths: ManagerPaths, mode: str) -> str:
+    normalized = _normalize_switch_mode(mode)
+    if normalized != mode.strip().lower():
+        raise ValueError(f"Unsupported switch mode: {mode}")
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        state["switch_mode"] = normalized
+        save_state(paths, state)
+        return normalized
+
+
+def update_switch_policy(
+    paths: ManagerPaths,
+    *,
+    short_usage_threshold_percent: float | None = None,
+    refresh_failure_threshold: int | None = None,
+    candidate_strategy: str | None = None,
+) -> dict:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        policy = _state_switch_policy(state)
+        if short_usage_threshold_percent is not None:
+            value = float(short_usage_threshold_percent)
+            if value < 0.0 or value > 100.0:
+                raise ValueError("short_usage_threshold_percent must be between 0 and 100.")
+            policy["short_usage_threshold_percent"] = value
+        if refresh_failure_threshold is not None:
+            value = int(refresh_failure_threshold)
+            if value < 1:
+                raise ValueError("refresh_failure_threshold must be at least 1.")
+            policy["refresh_failure_threshold"] = value
+        if candidate_strategy is not None:
+            normalized_strategy = _normalize_candidate_strategy(candidate_strategy)
+            if normalized_strategy != candidate_strategy.strip().lower():
+                raise ValueError(f"Unsupported candidate strategy: {candidate_strategy}")
+            policy["candidate_strategy"] = normalized_strategy
+        state["switch_policy"] = policy
+        save_state(paths, state)
+        return dict(policy)
 
 
 def set_enabled(paths: ManagerPaths, name: str, enabled: bool) -> None:
@@ -1565,6 +1972,8 @@ def clear_bad(paths: ManagerPaths, name: str) -> None:
             raise ValueError(f"Account not found: {name}")
         meta["last_error"] = None
         meta["cooldown_until"] = None
+        meta["refresh_fail_count"] = 0
+        meta["last_live_check_error"] = None
         state = sync_state_from_disk(paths, state)
         save_state(paths, state)
 
@@ -1656,6 +2065,7 @@ def rotate_after_failure(
     reason: str,
     cooldown_minutes: int = 60,
     live_dir: Path | None = None,
+    force_switch: bool = False,
 ) -> RotationResult:
     if cooldown_minutes < 0:
         raise ValueError("Cooldown minutes must be non-negative.")
@@ -1664,6 +2074,7 @@ def rotate_after_failure(
         state = sync_state_from_disk(paths, load_state(paths))
         if live_dir is not None:
             state["live_dir"] = str(live_dir.resolve())
+        switch_mode = get_switch_mode(state)
 
         previous = state.get("active")
         if not previous:
@@ -1699,20 +2110,14 @@ def rotate_after_failure(
         state["active"] = None
         state = sync_state_from_disk(paths, state)
 
-        candidates = [
-            name
-            for name, candidate_meta in sorted(state["accounts"].items())
-            if name != previous
-            and candidate_meta.get("enabled", True)
-            and candidate_meta.get("status") != "cooldown"
-        ]
-
-        switched_to = candidates[0] if candidates else None
-        if switched_to:
-            _copy_active_runtime(paths, switched_to)
-            state["active"] = switched_to
-            state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
+        switched_to = None
+        if force_switch or switch_mode == "auto":
+            switched_to = _best_switch_candidate(paths, state, exclude=previous)
+            if switched_to:
+                _copy_active_runtime(paths, switched_to)
+                state["active"] = switched_to
+                state = sync_state_from_disk(paths, state)
+                _sync_runtime_to_live_dir(paths, state)
 
         save_state(paths, state)
         return RotationResult(
@@ -1821,6 +2226,7 @@ def format_status(paths: ManagerPaths) -> str:
         f"lock: {paths.lock_file}",
         f"live_dir: {state.get('live_dir') or '-'}",
         f"active: {state.get('active') or '-'}",
+        f"switch_mode: {get_switch_mode(state)}",
         "accounts:",
     ]
     for name, meta in sorted(state["accounts"].items()):
@@ -1835,6 +2241,8 @@ def format_status(paths: ManagerPaths) -> str:
             extra.append(f"cooldown_until={meta['cooldown_until']}")
         if meta.get("fail_count"):
             extra.append(f"fail_count={meta['fail_count']}")
+        if meta.get("refresh_fail_count"):
+            extra.append(f"refresh_fail_count={meta['refresh_fail_count']}")
         if meta.get("last_error"):
             extra.append(f"last_error={meta['last_error']}")
         suffix = f" [{' ; '.join(extra)}]" if extra else ""

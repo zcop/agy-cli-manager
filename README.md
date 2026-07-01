@@ -19,6 +19,8 @@ It is application-agnostic. A Telegram bot can call it, but the manager itself i
 - keeps one account active while others stay standby/cooldown/disabled
 - supports isolated interactive `agy` login
 - can import an existing `~/.gemini` or similar live home
+- supports both manual-only and automatic failover switching modes
+- prefers fuller, healthier standby accounts when auto-switching
 - tracks cached identity, health, and usage metadata
 - exposes CLI commands and JSON output for automation
 - supports account failover with cooldowns and lock-protected state changes
@@ -120,6 +122,12 @@ With no subcommand, the full-screen dashboard opens by default.
 agy-cli-manager status --json
 agy-cli-manager whoami
 agy-cli-manager models --json
+agy-cli-manager ensure-active --json
+agy-cli-manager switch-mode
+agy-cli-manager switch-mode manual
+agy-cli-manager switch-mode auto
+agy-cli-manager switch-policy --json
+agy-cli-manager switch-policy --short-threshold 10 --refresh-failure-threshold 2 --candidate-strategy balanced
 agy-cli-manager refresh-usage --json
 agy-cli-manager switch-next
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
@@ -172,6 +180,11 @@ agy-cli-manager list
 agy-cli-manager current
 agy-cli-manager status
 agy-cli-manager status --json
+agy-cli-manager ensure-active
+agy-cli-manager switch-mode
+agy-cli-manager switch-mode manual
+agy-cli-manager switch-mode auto
+agy-cli-manager switch-policy
 agy-cli-manager refresh-usage
 agy-cli-manager refresh-usage account1 --json
 agy-cli-manager refresh-due
@@ -197,7 +210,9 @@ agy-cli-manager mark-bad account1 --reason quota --cooldown-minutes 60
 agy-cli-manager clear-bad account1
 agy-cli-manager set-live-dir ~/.gemini
 agy-cli-manager apply-active
+agy-cli-manager switch-mode manual
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --force-switch --json
 agy-cli-manager update-meta account1 --usage-status known --usage-value 42 --reset-at 2026-07-01T00:00:00+00:00 --health-status healthy --last-live-check-at 2026-06-30T06:00:00+00:00 --next-live-check-at 2026-06-30T06:30:00+00:00 --refresh-policy-seconds 1800
 agy-cli-manager update-meta account1 --short-usage-status known --short-usage-value 97.57 --short-reset-at 2026-07-01T00:00:00+00:00 --weekly-usage-status unknown
 ```
@@ -215,6 +230,8 @@ For automation, prefer the JSON-capable commands:
 agy-cli-manager status --json
 agy-cli-manager current --json
 agy-cli-manager list --json
+agy-cli-manager ensure-active --json
+agy-cli-manager switch-policy --json
 agy-cli-manager refresh-usage account1 --json
 agy-cli-manager refresh-due --json
 agy-cli-manager models --json
@@ -224,10 +241,12 @@ agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
 Typical external-app flow:
 
 1. read current state with `status --json`
-2. use `models --json` if the caller needs model choices for the active account
-3. call `refresh-usage --json` or `refresh-due --json` only when needed
-4. if a real request fails due to auth/quota, call `rotate-after-failure --json`
-5. persist caller-side observations back with `update-meta`
+2. call `ensure-active --json` before sending real work if you want the manager to preflight the active account
+3. read `switch_mode` and `switch_policy` to decide how aggressively your caller should auto-fail over
+4. use `models --json` if the caller needs model choices for the active account
+5. call `refresh-usage --json` or `refresh-due --json` only when needed
+6. if a real request fails due to auth/quota, call `rotate-after-failure --json`
+7. persist caller-side observations back with `update-meta`
 
 Notes:
 
@@ -238,6 +257,9 @@ Notes:
 - `agy-cli-manager login` prompts for the account name if you do not pass one
 - `switch-next` skips accounts in cooldown.
 - `mark-bad` clears the active pointer if that account was active.
+- `ensure-active` evaluates the current policy and can automatically recover from no active account, known low 5-hour quota, auth expiry, or repeated refresh failures.
+- `switch-mode` controls whether `rotate-after-failure` automatically moves to the next eligible standby account or stops after marking the active account bad.
+- `switch-policy` controls the proactive short-window threshold, refresh-failure threshold, and standby candidate ranking strategy.
 - state and switching are protected by a single lock file so a caller can safely trigger failover from another process.
 - `set-live-dir` lets the manager drive a real CLI home in addition to its own internal `runtime/`.
 - the manager snapshots the managed CLI home paths (`.gemini`, `.config`, `.cache`, `.local`) instead of assuming a single token file is enough.
@@ -248,11 +270,15 @@ Notes:
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
 - `models` runs `agy models` for the active account or a named saved profile and can return structured JSON for external callers.
 - the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
+- in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to `10%` or lower, auth is expired/missing, or refresh failures reach the built-in threshold.
+- when auto-switching, the manager ranks the standby pool and prefers accounts with better health and more remaining short-window quota instead of simply taking the first account by name.
+- the default switch policy is `short_usage_threshold_percent=10`, `refresh_failure_threshold=2`, `candidate_strategy=balanced`.
 - `rotate-after-failure` is the public failover operation for external apps: mark the current active account bad, optionally put it in cooldown, then switch to the next eligible standby account.
+- `rotate-after-failure` follows the persisted switch mode by default: `auto` attempts failover, `manual` leaves the manager inactive until an operator or caller explicitly switches accounts. Use `--force-switch` to override that for one run.
 - `update-meta` lets an external app persist cached runtime metadata such as usage, reset time, health, last check, and next refresh time.
 - `refresh-due` is the non-interactive refresh entrypoint for cron/systemd/external callers; it refreshes the active account first when due, otherwise the first due eligible standby account.
 - usage metadata is stored under `usage_windows.short` and `usage_windows.weekly`; the old flat `usage_*` and `reset_at` fields remain as compatibility aliases for the short window.
-- dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
+- dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `w` toggle switch mode (`auto`/`manual`), `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
 
 Cached runtime metadata:
 
@@ -269,13 +295,23 @@ Python usage:
 ```python
 from pathlib import Path
 
-from agy_cli_manager import build_paths, get_status_snapshot, list_models, rotate_after_failure
+from agy_cli_manager import (
+    build_paths,
+    get_status_snapshot,
+    get_switch_policy,
+    list_models,
+    rotate_after_failure,
+    update_switch_policy,
+)
 
 paths = build_paths(Path.home() / ".agy-cli-manager")
 snapshot = get_status_snapshot(paths)
+policy = get_switch_policy(paths)
+update_switch_policy(paths, short_usage_threshold_percent=12.5, candidate_strategy="highest-short")
 models = list_models(paths)
 result = rotate_after_failure(paths, reason="quota", cooldown_minutes=60)
 print(snapshot["active"], "->", result.switched_to)
+print(policy)
 print([model["name"] for model in models["models"]])
 ```
 
