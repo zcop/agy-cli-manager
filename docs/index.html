@@ -4,17 +4,47 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>agy-cli-manager | Antigravity CLI Account Manager</title>
-  <meta name="description" content="agy-cli-manager is an Antigravity CLI account manager for multi-account failover, quota-aware switching, and automation via CLI or Python API.">
+  <meta name="description" content="agy-cli-manager is an Antigravity CLI multi-account auth manager for account login storage, quota-aware failover, runtime account rotation, and automation via CLI or Python API.">
+  <meta name="keywords" content="Antigravity CLI account manager, Antigravity CLI multi account manager, Antigravity multi account auth, Antigravity login manager, Antigravity auth manager, Antigravity account switcher, Antigravity CLI failover, Antigravity CLI quota switching, agy account manager, agy multi account manager, agy multi account auth, agy account switcher, agy login manager, agy auth manager, agy failover, agy quota switching, Gemini CLI multi account auth, Gemini CLI account rotation, Gemini auth manager, CLI account rotation manager, Antigravity automation API, agy automation API, agy dashboard">
   <meta name="robots" content="index,follow">
   <link rel="canonical" href="https://zcop.github.io/agy-cli-manager/">
   <meta property="og:type" content="website">
   <meta property="og:title" content="agy-cli-manager | Antigravity CLI Account Manager">
-  <meta property="og:description" content="Manage multiple Antigravity CLI accounts with active-standby failover, quota-aware switching, and automation APIs.">
+  <meta property="og:description" content="Manage multiple Antigravity CLI accounts with multi-account auth storage, active-standby failover, quota-aware switching, coordinated runtime failover, and automation APIs.">
   <meta property="og:url" content="https://zcop.github.io/agy-cli-manager/">
   <meta property="og:image" content="https://zcop.github.io/agy-cli-manager/dashboard-screenshot.svg">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="agy-cli-manager | Antigravity CLI Account Manager">
-  <meta name="twitter:description" content="Multi-account failover and quota-aware switching for Antigravity CLI.">
+  <meta name="twitter:description" content="Multi-account auth, failover, quota-aware switching, and automation for Antigravity CLI.">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "agy-cli-manager",
+    "codeRepository": "https://github.com/zcop/agy-cli-manager",
+    "url": "https://zcop.github.io/agy-cli-manager/",
+    "description": "An Antigravity CLI multi-account auth manager for account login storage, active-standby failover, quota-aware switching, coordinated runtime account rotation, and automation via CLI or Python API.",
+    "programmingLanguage": "Python",
+    "runtimePlatform": "Linux, macOS, Terminal",
+    "license": "https://github.com/zcop/agy-cli-manager/blob/main/LICENSE",
+    "keywords": [
+      "Antigravity CLI account manager",
+      "Antigravity CLI multi account manager",
+      "Antigravity multi account auth",
+      "Antigravity login manager",
+      "Antigravity auth manager",
+      "agy multi account manager",
+      "agy multi account auth",
+      "agy auth manager",
+      "agy login manager",
+      "agy failover",
+      "agy quota switching",
+      "CLI account rotation manager",
+      "Gemini CLI multi account auth",
+      "Gemini CLI account rotation"
+    ]
+  }
+  </script>
   <style>
     :root {
       --bg: #f5f2ea;
@@ -150,8 +180,9 @@
         <p class="eyebrow">Antigravity CLI Tooling</p>
         <h1>agy-cli-manager</h1>
         <p class="lede">
-          A multi-account manager for Antigravity CLI (`agy`) with active-standby failover,
-          quota-aware account switching, Python API control, and terminal dashboard workflows.
+          A multi-account auth and account-switching manager for Antigravity CLI (`agy`)
+          with active-standby failover, quota-aware account switching, coordinated runtime
+          failover, Python API control, and terminal dashboard workflows.
         </p>
         <div class="actions">
           <a class="button primary" href="https://github.com/zcop/agy-cli-manager">View on GitHub</a>
@@ -162,7 +193,9 @@
         <h2>What It Solves</h2>
         <ul>
           <li>Manage multiple `agy` accounts from one runtime.</li>
+          <li>Store and restore multiple AGY login/auth profiles safely.</li>
           <li>Switch off low-quota or failed accounts automatically.</li>
+          <li>Coordinate runtime failover to avoid double account switching.</li>
           <li>Expose machine-readable APIs for bots and schedulers.</li>
           <li>Support manual and automatic switching policies.</li>
         </ul>
@@ -191,6 +224,18 @@ pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.0/agy
           <h3>Automation API</h3>
           <p>Control switch mode, switch policy, usage refresh, and failover through CLI commands or a Python API.</p>
         </div>
+        <div class="card">
+          <h3>Runtime Failover Control</h3>
+          <p>Coordinate account switching for callers like bots so one failure event leads to one managed switch and one retry.</p>
+        </div>
+        <div class="card">
+          <h3>Terminal Dashboard</h3>
+          <p>Inspect active, standby, cooldown, usage, and switch runtime state from a focused TUI built for operator workflows.</p>
+        </div>
+        <div class="card">
+          <h3>Bot Integration</h3>
+          <p>Use the manager as a switch authority for Telegram bots, automation workers, or any app that needs controlled AGY failover.</p>
+        </div>
       </div>
     </section>
 
@@ -214,15 +259,26 @@ update_switch_policy(
       <h2>Use Cases</h2>
       <p class="muted">
         `agy-cli-manager` is useful for Telegram bots, automation workers, cron or systemd timers,
-        multi-account Antigravity CLI setups, and failover-aware local tooling.
+        multi-account Antigravity CLI auth setups, runtime account rotation, account login storage,
+        and failover-aware local tooling.
       </p>
       <p class="keywords">
-        Keywords: Antigravity CLI account manager, agy multi account manager, agy failover,
-        agy quota switching, Gemini CLI account rotation, active-standby CLI manager.
+        Keywords: Antigravity CLI account manager, agy multi account manager, agy multi account auth,
+        agy login manager, agy auth manager, agy account switcher, agy failover,
+        agy quota switching, Antigravity CLI multi account manager, Antigravity multi account auth,
+        Antigravity login manager, Antigravity auth manager, Antigravity account switcher,
+        Gemini CLI multi account auth, Gemini CLI account rotation, active-standby CLI manager,
+        agy automation API, Antigravity automation API, Antigravity CLI failover,
+        runtime account rotation manager.
       </p>
     </section>
 
     <footer>
+      <p>
+        agy-cli-manager is an open source Antigravity CLI account manager focused on
+        multi-account auth storage, quota-aware AGY switching, coordinated runtime retry flows,
+        login profile management, and automation-friendly CLI and Python APIs.
+      </p>
       <p>Source code, releases, and documentation live on GitHub.</p>
     </footer>
   </main>

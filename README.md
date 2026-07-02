@@ -5,12 +5,12 @@
 It helps you run multiple Antigravity CLI accounts more safely by:
 
 - switching away from low-quota or failed accounts
-- keeping a managed runtime home in sync with the active profile
+- keeping a managed runtime profile in sync with the active account
 - exposing CLI and Python APIs for bots, schedulers, and external apps
 - supporting manual or automatic account rotation policies
 
 Keywords:
-Antigravity CLI account manager, agy multi account manager, agy failover, agy quota switching, Gemini CLI account rotation.
+Antigravity CLI account manager, Antigravity CLI multi account manager, Antigravity multi account auth, Antigravity login manager, Antigravity auth manager, Antigravity account switcher, agy multi account manager, agy multi account auth, agy login manager, agy auth manager, agy failover, agy quota switching, Gemini CLI multi account auth, Gemini CLI account rotation.
 
 It is designed for one active account at a time:
 
@@ -38,6 +38,7 @@ Project links:
 - supports both manual-only and automatic failover switching modes
 - prefers fuller, healthier standby accounts when auto-switching
 - tracks cached identity, health, and usage metadata
+- tracks live switch coordinator state for callers that need to wait on failover
 - exposes CLI commands and JSON output for automation
 - supports account failover with cooldowns and lock-protected state changes
 
@@ -160,26 +161,17 @@ Directory layout:
 ~/.agy-cli-manager/
 ├── accounts/
 │   └── <account-name>/
-│       ├── .gemini/
-│       │   └── ...
-│       ├── .config/
-│       │   └── ...
-│       ├── .cache/
-│       │   └── ...
-│       └── .local/
+│       └── .gemini/
 │           └── ...
 ├── runtime/
-│   ├── .gemini/
-│   ├── .config/
-│   ├── .cache/
-│   └── .local/
+│   └── .gemini/
 └── state.json
 ```
 
 Optional integration:
 
 - `live_dir` can point at a real Antigravity/Gemini CLI home such as `~/.gemini`
-- when set, switches sync the managed CLI home snapshot into that runtime home and clear token cache there too
+- when set, switches sync the managed active profile into that live CLI home
 
 Example:
 
@@ -268,7 +260,9 @@ Typical external-app flow:
 4. use `models --json` if the caller needs model choices for the active account
 5. call `refresh-usage --json` or `refresh-due --json` only when needed
 6. if a real request fails due to auth/quota, call `rotate-after-failure --json`
-7. persist caller-side observations back with `update-meta`
+7. inspect `switch_runtime` or wait briefly until it leaves `switching`
+8. retry the real request once on the new active account
+9. persist caller-side observations back with `update-meta`
 
 Notes:
 
@@ -279,28 +273,33 @@ Notes:
 - `agy-cli-manager login` prompts for the account name if you do not pass one
 - `switch-next` skips accounts in cooldown.
 - `mark-bad` clears the active pointer if that account was active.
-- `ensure-active` evaluates the current policy and can automatically recover from no active account, known low 5-hour quota, auth expiry, or repeated refresh failures.
+- `ensure-active` evaluates the current policy and can automatically recover from no active account, known low 5-hour quota, auth missing, or repeated refresh failures.
+- `ensure-active` returns JSON with `switch_runtime`, so callers can see whether the manager is idle, switching, ready, or has no standby account available.
 - `switch-mode` controls whether `rotate-after-failure` automatically moves to the next eligible standby account or stops after marking the active account bad.
 - `switch-policy` controls the proactive short-window threshold, refresh-failure threshold, and standby candidate ranking strategy.
 - state and switching are protected by a single lock file so a caller can safely trigger failover from another process.
 - `set-live-dir` lets the manager drive a real CLI home in addition to its own internal `runtime/`.
-- the manager snapshots the managed CLI home paths (`.gemini`, `.config`, `.cache`, `.local`) instead of assuming a single token file is enough.
-- it supports both Gemini-style root auth files and Antigravity-style `antigravity-cli/antigravity-oauth-token` auth storage.
+- the manager currently copies the managed profile under `.gemini/`, centered on the Antigravity auth/token artifacts it needs for switching.
+- it supports Antigravity-style `antigravity-cli/antigravity-oauth-token` auth storage and related identity extraction.
 - `login` hands the terminal directly to a real `agy` session in the configured runtime home; complete onboarding/login there, exit `agy`, and the manager then saves the captured profile snapshot.
 - `login` stores the profile under the detected account name when available, not just the typed label.
 - if that detected account already exists, `login` warns and asks whether to overwrite the saved profile.
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
 - `models` runs `agy models` for the active account or a named saved profile and can return structured JSON for external callers.
 - the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
-- in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to the configured `short_usage_threshold_percent`, auth is expired/missing, or refresh failures reach the configured threshold.
+- in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to the configured `short_usage_threshold_percent`, auth is missing, or refresh failures reach the configured threshold.
+- cached quota is advisory; real runtime failure is still the final authority for callers such as bots.
 - when auto-switching, the manager ranks the standby pool and prefers accounts with better health and more remaining short-window quota instead of simply taking the first account by name.
 - the default switch policy is `short_usage_threshold_percent=10`, `refresh_failure_threshold=2`, `candidate_strategy=balanced`.
 - `rotate-after-failure` is the public failover operation for external apps: mark the current active account bad, optionally put it in cooldown, then switch to the next eligible standby account.
+- `rotate-after-failure` is idempotent across a short dedupe window and reports an `outcome` such as `switched`, `already_switched`, or `no_candidate`.
+- `switch_runtime` is persisted in state so a caller can coordinate retry logic without racing another caller into a second switch.
 - `rotate-after-failure` follows the persisted switch mode by default: `auto` attempts failover, `manual` leaves the manager inactive until an operator or caller explicitly switches accounts. Use `--force-switch` to override that for one run.
 - `update-meta` lets an external app persist cached runtime metadata such as usage, reset time, health, last check, and next refresh time.
 - `refresh-due` is the non-interactive refresh entrypoint for cron/systemd/external callers; it refreshes the active account first when due, otherwise the first due eligible standby account.
 - usage metadata is stored under `usage_windows.short` and `usage_windows.weekly`; the old flat `usage_*` and `reset_at` fields remain as compatibility aliases for the short window.
 - dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `w` toggle switch mode (`auto`/`manual`), `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
+- dashboard overview now shows both account quota state and switch coordinator state.
 
 Cached runtime metadata:
 
@@ -354,6 +353,19 @@ Public Python API:
 - `set_switch_mode(paths, mode)`
 - `set_live_dir(paths, live_dir)`
 - `update_account_runtime_metadata(paths, name, ...)`
+
+Important returned state:
+
+- `get_status_snapshot(paths)` includes `switch_runtime`
+- `ensure_active_account(...)` reports the active account decision
+- `rotate_after_failure(...)` returns a `RotationResult` with `outcome`
+
+`switch_runtime` has these practical states:
+
+- `idle`: no failover is happening
+- `switching`: a caller has started coordinated failover
+- `ready`: failover finished and an active account is set
+- `no_account`: failover finished but no eligible standby account was available
 
 More explicit example:
 
