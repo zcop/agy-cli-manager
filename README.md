@@ -139,6 +139,8 @@ With no subcommand, the full-screen dashboard opens by default.
 
 `agy` never calls the manager. `switch-mode auto` plus `ensure-active` / `refresh-due` only see cached Cloud Code usage. The TUI banner `Individual quota reached` is written to `~/.gemini/antigravity-cli/log/cli-*.log`.
 
+![Quota log watch](docs/quota-log-watch.svg)
+
 Leave the dashboard open, or run a dedicated watcher:
 
 ```bash

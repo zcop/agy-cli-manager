@@ -5,6 +5,7 @@
 - add `agy-cli-manager watch` to tail Antigravity CLI logs and fail over on `Individual quota reached`
 - poll those logs from the dashboard in auto mode and record `trigger=log-watch`
 - persist log cursors in `log-watch.json` so historical quota errors are not replayed
+- add a quota log watch architecture diagram in `docs/quota-log-watch.svg`
 - use `msvcrt` file locking on Windows so the manager can import without `fcntl`
 
 ## v0.2.1 - 2026-07-15
