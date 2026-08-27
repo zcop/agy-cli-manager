@@ -11,6 +11,7 @@
 - initialize existing logs at EOF; only files created after watcher start are read from offset 0
 - lock and atomically replace `log-watch.json` so dashboard and `watch` cannot clobber cursors
 - add `agy-cli-manager ack-restart` (dashboard `Y`) to clear `restart_required` after `agy` is restarted
+- persist an `initialized` marker so the first log created after an empty start is read from offset 0
 
 ## v0.2.1 - 2026-07-15
 

@@ -191,10 +191,41 @@ class CursorAndConsumeTests(unittest.TestCase):
 
             created = log_dir / "cli-new.log"
             created.write_text(SAMPLE_TUI_LINE + "\n", encoding="utf-8")
-            _cursors, events = consume_log_events(live_dir, cursors, from_start=False)
+            _cursors, events = consume_log_events(
+                live_dir,
+                cursors,
+                from_start=False,
+                initialized=True,
+            )
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].kind, "individual_quota")
             self.assertEqual(events[0].path, str(created))
+
+    def test_first_log_created_after_empty_init_is_read_from_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / ".gemini"
+            log_dir = live_dir / "antigravity-cli" / "log"
+            log_dir.mkdir(parents=True)
+            cursors, events = consume_log_events(
+                live_dir,
+                {},
+                from_start=False,
+                initialized=False,
+            )
+            self.assertEqual(events, [])
+            self.assertEqual(cursors, {})
+
+            log_path = log_dir / "cli-new.log"
+            log_path.write_text(SAMPLE_TUI_LINE + "\n", encoding="utf-8")
+            _cursors, events = consume_log_events(
+                live_dir,
+                cursors,
+                from_start=False,
+                initialized=True,
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].kind, "individual_quota")
+            self.assertEqual(events[0].path, str(log_path))
 
 
 def _write_token_home(root: Path, name: str) -> Path:
@@ -360,6 +391,36 @@ class LogWatchIntegrationTests(unittest.TestCase):
             payload = json.loads(log_watch_state_path(paths.root).read_text(encoding="utf-8"))
             self.assertEqual(payload["cursors"][str(log_path)]["offset"], log_path.stat().st_size)
             self.assertEqual(state["cursors"][str(log_path)]["offset"], log_path.stat().st_size)
+
+    def test_empty_init_then_first_quota_log_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "manager"
+            live_dir = Path(tmp) / "live" / ".gemini"
+            log_dir = live_dir / "antigravity-cli" / "log"
+            log_dir.mkdir(parents=True)
+            paths = build_paths(root)
+            ensure_layout(paths)
+            set_live_dir(paths, live_dir)
+            add_account(paths, "account-a", _write_token_home(Path(tmp), "account-a"))
+            add_account(paths, "account-b", _write_token_home(Path(tmp), "account-b"))
+            set_switch_mode(paths, "auto")
+
+            first = poll_quota_logs(paths, rotate=True)
+            self.assertEqual(first.events, [])
+            self.assertFalse(first.rotated)
+            state = load_log_watch_state(paths.root)
+            self.assertTrue(state["initialized"])
+            self.assertEqual(state["cursors"], {})
+
+            log_path = log_dir / "cli-new.log"
+            log_path.write_text(SAMPLE_TUI_LINE + "\n", encoding="utf-8")
+            second = poll_quota_logs(paths, rotate=True)
+            self.assertEqual(len(second.events), 1)
+            self.assertEqual(second.events[0].kind, "individual_quota")
+            self.assertEqual(second.events[0].path, str(log_path))
+            self.assertTrue(second.rotated)
+            self.assertEqual(second.rotation.previous_active, "account-a")
+            self.assertEqual(second.rotation.switched_to, "account-b")
 
 
 if __name__ == "__main__":

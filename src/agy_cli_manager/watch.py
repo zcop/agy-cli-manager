@@ -67,6 +67,7 @@ def _default_log_watch_state() -> dict:
         "restart_armed_at": None,
         "restart_armed_account": None,
         "restart_source_logs": [],
+        "initialized": False,
         "updated_at": None,
     }
 
@@ -94,6 +95,11 @@ def _normalize_log_watch_state(raw: object) -> dict:
     source_logs = raw.get("restart_source_logs")
     if isinstance(source_logs, list):
         data["restart_source_logs"] = [item for item in source_logs if isinstance(item, str)]
+    if "initialized" in raw:
+        data["initialized"] = bool(raw.get("initialized"))
+    else:
+        # Legacy files without the marker already completed a poll if they have cursors.
+        data["initialized"] = bool(data["cursors"])
     return data
 
 
@@ -158,6 +164,7 @@ def get_log_watch_snapshot(paths: Any) -> dict:
         "restart_required": bool(state.get("restart_required")),
         "restart_armed_at": state.get("restart_armed_at"),
         "restart_armed_account": state.get("restart_armed_account"),
+        "initialized": bool(state.get("initialized")),
         "updated_at": state.get("updated_at"),
     }
 
@@ -255,7 +262,7 @@ def initial_log_offset(
     from_start: bool,
     started_at: float | None = None,
     known: bool = False,
-    initializing: bool = False,
+    initialized: bool = False,
 ) -> int:
     # started_at is kept for call-site compatibility. Existing files are
     # initialized at EOF; mtime is not used because writes refresh it.
@@ -268,9 +275,9 @@ def initial_log_offset(
         return 0
     if known:
         return 0
-    if initializing:
-        return size
-    return 0
+    if initialized:
+        return 0
+    return size
 
 
 def consume_log_events(
@@ -279,10 +286,10 @@ def consume_log_events(
     *,
     from_start: bool = False,
     started_at: float | None = None,
+    initialized: bool = False,
 ) -> tuple[dict[str, dict[str, int]], list[QuotaLogEvent]]:
     events: list[QuotaLogEvent] = []
     next_cursors = dict(cursors)
-    initializing = not bool(next_cursors)
     for path in iter_live_agy_log_files(live_dir):
         key = str(path)
         known = key in next_cursors
@@ -294,7 +301,7 @@ def consume_log_events(
                 from_start=from_start,
                 started_at=started_at,
                 known=known,
-                initializing=initializing,
+                initialized=initialized,
             )
         new_offset, lines = read_new_complete_lines(path, offset)
         next_cursors[key] = {"offset": new_offset}
@@ -360,13 +367,16 @@ def poll_quota_logs(
         switch_mode = get_switch_mode(state)
         watch_state = load_log_watch_state(paths.root)
         cursors = dict(watch_state.get("cursors") or {})
+        initialized = bool(watch_state.get("initialized"))
         next_cursors, events = consume_log_events(
             live_dir,
             cursors,
             from_start=from_start,
             started_at=started_at,
+            initialized=initialized,
         )
         watch_state["cursors"] = next_cursors
+        watch_state["initialized"] = True
         rotation = None
         rotated = False
         message = "no quota errors"
