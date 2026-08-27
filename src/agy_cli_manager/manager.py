@@ -18,7 +18,12 @@ import math
 from pathlib import Path
 from contextlib import contextmanager
 
-import fcntl
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+from agy_cli_manager.watch import get_log_watch_snapshot
 
 
 MANAGED_PROFILE_FILES = (
@@ -164,7 +169,16 @@ def ensure_layout(paths: ManagerPaths) -> None:
 def manager_lock(paths: ManagerPaths):
     ensure_layout(paths)
     with paths.lock_file.open("a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        if os.name == "nt":
+            # msvcrt.locking() requires an existing byte at the current
+            # position and locks a byte range rather than the whole file.
+            f.seek(0)
+            f.write("0")
+            f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             f.seek(0)
             f.truncate()
@@ -174,9 +188,19 @@ def manager_lock(paths: ManagerPaths):
         finally:
             try:
                 f.seek(0)
-                f.truncate()
+                if os.name == "nt":
+                    # Keep the locked byte present until msvcrt releases it.
+                    f.write("0")
+                    f.truncate(1)
+                    f.flush()
+                else:
+                    f.truncate()
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_state(paths: ManagerPaths) -> dict:
@@ -2052,6 +2076,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "switch_policy": _state_switch_policy(state),
         "switch_runtime": _normalize_switch_runtime(state.get("switch_runtime")),
         "switch_history": _normalize_switch_history(state.get("switch_history")),
+        "log_watch": get_log_watch_snapshot(paths),
         "accounts": snapshot_accounts,
     }
 

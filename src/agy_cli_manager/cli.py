@@ -47,6 +47,11 @@ from agy_cli_manager.manager import (
     update_account_runtime_metadata,
     verify_accounts,
 )
+from agy_cli_manager.watch import (
+    format_watch_poll,
+    poll_quota_logs,
+    watch_quota_logs,
+)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agy-cli-manager")
@@ -165,6 +170,16 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument("--live-dir")
     rotate.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
     rotate.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    watch = sub.add_parser("watch", help="Watch Antigravity CLI logs and fail over on quota errors")
+    watch.add_argument("--once", action="store_true", help="Scan newly appended log bytes once and exit")
+    watch.add_argument("--from-start", action="store_true", help="Read existing log bytes from offset 0 instead of skipping history")
+    watch.add_argument("--poll-seconds", type=float, default=1.0, help="Follow poll interval in seconds")
+    watch.add_argument("--no-rotate", action="store_true", help="Detect quota errors without calling rotate-after-failure")
+    watch.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
+    watch.add_argument("--cooldown-minutes", type=int, default=60)
+    watch.add_argument("--on-rotate", help="Shell command to run after a successful switch")
+    watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     update_meta = sub.add_parser("update-meta", help="Update cached runtime metadata for an account")
     update_meta.add_argument("name")
@@ -1362,6 +1377,8 @@ def _dashboard(stdscr, paths) -> int:
     refresh_thread: threading.Thread | None = None
     refresh_inflight_name: str | None = None
     refresh_backoff_until: dict[str, float] = {}
+    last_log_poll = 0.0
+    log_watch_started_at = time.time()
 
     while True:
         try:
@@ -1426,6 +1443,7 @@ def _dashboard(stdscr, paths) -> int:
             f" | UI Refresh: {interval}s"
             f" | Sort: {sort_mode_name}"
             f" | Switch: {snapshot.get('switch_mode') or 'auto'}"
+            f" | LogWatch: {'restart agy' if (snapshot.get('log_watch') or {}).get('restart_required') else 'on'}"
             " | Live Status: Auto+Manual"
         )
         top_lines = _draw_wrapped_lines(stdscr, 0, top, _color_attr(COLOR_HEADER, curses.A_BOLD))
@@ -1549,6 +1567,22 @@ def _dashboard(stdscr, paths) -> int:
                 refresh_thread = _start_usage_refresh_worker(paths, auto_target_name, refresh_result_queue)
                 refresh_inflight_name = auto_target_name
                 message = f"Background refreshing {auto_target_name}..."
+
+        if now - last_log_poll >= 1.0:
+            last_log_poll = now
+            try:
+                watch_result = poll_quota_logs(
+                    paths,
+                    started_at=log_watch_started_at,
+                    rotate=True,
+                )
+            except ValueError as exc:
+                message = f"Log-watch error: {exc}"
+            else:
+                if watch_result.events or watch_result.rotated:
+                    snapshot = _refresh_dashboard_snapshot(paths)
+                    last_refresh = time.time()
+                    message = format_watch_poll(watch_result)
 
         try:
             key = stdscr.getch()
@@ -2143,6 +2177,19 @@ def main() -> int:
                 else:
                     print("no-active-account")
             return 0
+        if args.command == "watch":
+            return watch_quota_logs(
+                paths,
+                follow=not args.once,
+                once=args.once,
+                from_start=args.from_start,
+                poll_seconds=args.poll_seconds,
+                rotate=not args.no_rotate,
+                force_switch=args.force_switch,
+                cooldown_minutes=args.cooldown_minutes,
+                on_rotate=args.on_rotate,
+                as_json=args.json,
+            )
         if args.command == "update-meta":
             meta = update_account_runtime_metadata(
                 paths,

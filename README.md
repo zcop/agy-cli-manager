@@ -5,6 +5,7 @@
 It helps you run multiple Antigravity CLI accounts more safely by:
 
 - switching away from low-quota or failed accounts
+- watching live Antigravity CLI logs for `Individual quota reached` and failing over automatically
 - keeping a managed runtime profile in sync with the active account
 - exposing CLI and Python APIs for bots, schedulers, and external apps
 - supporting manual or automatic account rotation policies
@@ -41,6 +42,7 @@ Project links:
 - tracks live switch coordinator state for callers that need to wait on failover
 - exposes CLI commands and JSON output for automation
 - supports account failover with cooldowns and lock-protected state changes
+- tails Antigravity CLI logs so a running `agy` TUI can trigger failover without a bot caller
 
 ## Requirements
 
@@ -133,6 +135,19 @@ agy-cli-manager
 
 With no subcommand, the full-screen dashboard opens by default.
 
+### 5. Watch live `agy` quota errors
+
+`agy` never calls the manager. `switch-mode auto` plus `ensure-active` / `refresh-due` only see cached Cloud Code usage. The TUI banner `Individual quota reached` is written to `~/.gemini/antigravity-cli/log/cli-*.log`.
+
+Leave the dashboard open, or run a dedicated watcher:
+
+```bash
+agy-cli-manager switch-mode auto
+agy-cli-manager watch
+```
+
+On a match the watcher calls `rotate-after-failure --reason quota --trigger log-watch`. A running `agy` process keeps the old token in memory, so restart it after a switch. `--on-rotate` can run a helper command after a successful failover. Do not pass `--from-start` unless you intend to replay historical quota errors.
+
 ## First Useful Commands
 
 ```bash
@@ -148,6 +163,8 @@ agy-cli-manager switch-policy --short-threshold 10 --refresh-failure-threshold 2
 agy-cli-manager refresh-usage --json
 agy-cli-manager switch-next
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+agy-cli-manager watch
+agy-cli-manager watch --once --json
 ```
 
 The current switch policy is stored in manager state and can be controlled by either:
@@ -226,6 +243,9 @@ agy-cli-manager apply-active
 agy-cli-manager switch-mode manual
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --force-switch --json
+agy-cli-manager watch
+agy-cli-manager watch --once --json
+agy-cli-manager watch --no-rotate --once
 agy-cli-manager update-meta account1 --usage-status known --usage-value 42 --reset-at 2026-07-01T00:00:00+00:00 --health-status healthy --last-live-check-at 2026-06-30T06:00:00+00:00 --next-live-check-at 2026-06-30T06:30:00+00:00 --refresh-policy-seconds 1800
 agy-cli-manager update-meta account1 --short-usage-status known --short-usage-value 97.57 --short-reset-at 2026-07-01T00:00:00+00:00 --weekly-usage-status unknown
 ```
@@ -250,6 +270,7 @@ agy-cli-manager refresh-usage account1 --json
 agy-cli-manager refresh-due --json
 agy-cli-manager models --json
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+agy-cli-manager watch --once --json
 ```
 
 Typical external-app flow:
@@ -286,7 +307,10 @@ Notes:
 - if that detected account already exists, `login` warns and asks whether to overwrite the saved profile.
 - `whoami` reports the detected signed-in account name from profile metadata, and `--probe-usage` can additionally run `agy -p /usage` against that profile as a live check.
 - `models` runs `agy models` for the active account or a named saved profile and can return structured JSON for external callers.
-- the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based and runtime health should come from real request success/failure in the caller.
+- the manager intentionally does not use scripted PTY startup probing for `agy`; profile switching is filesystem-based. Runtime health still comes from real request success/failure, including Antigravity CLI log lines.
+- `watch` tails `live_dir/antigravity-cli/log/` (and `cli.log`) for `RESOURCE_EXHAUSTED (code 429): Individual quota reached` and weekly quota lines. It starts at end-of-file so historical quota errors are not replayed.
+- in `auto` mode, `watch` and the dashboard log poll call `rotate-after-failure` with `trigger=log-watch`. In `manual` mode they report the error and leave the active account in place unless `--force-switch` is set.
+- a switched profile is on disk (and in the live CLI home) immediately; a running `agy` process must be restarted to pick up the new token.
 - in `auto` mode, `ensure-active` and `refresh-usage`/`refresh-due` can proactively switch away from an active account when the cached 5-hour window falls to the configured `short_usage_threshold_percent`, auth is missing, or refresh failures reach the configured threshold.
 - cached quota is advisory; real runtime failure is still the final authority for callers such as bots.
 - when auto-switching, the manager ranks the standby pool and prefers accounts with better health and more remaining short-window quota instead of simply taking the first account by name.
@@ -300,6 +324,7 @@ Notes:
 - usage metadata is stored under `usage_windows.short` and `usage_windows.weekly`; the old flat `usage_*` and `reset_at` fields remain as compatibility aliases for the short window.
 - dashboard keybindings: `Up/Down` or `j/k` move, `n` login, `i` import, `Enter` or `a` activate, `r` rotate, `w` toggle switch mode (`auto`/`manual`), `e` enable/disable, `c` clear bad, `m` mark bad, `s` cycle sort (`added`, `usage`, `countdown`), `u` local refresh, `t` cycle UI refresh (`5s/10s/15s/30s`), `q` quit.
 - dashboard overview now shows both account quota state and switch coordinator state.
+- while the dashboard is open it also tails live Antigravity CLI logs every second and can fail over in `auto` mode. The header shows `LogWatch: restart agy` until you restart `agy` after a log-triggered switch.
 
 Cached runtime metadata:
 
@@ -321,6 +346,7 @@ from agy_cli_manager import (
     get_status_snapshot,
     get_switch_policy,
     list_models,
+    poll_quota_logs,
     rotate_after_failure,
     update_switch_policy,
 )
@@ -350,13 +376,16 @@ Public Python API:
 - `switch_account(paths, name)`
 - `switch_next(paths)`
 - `rotate_after_failure(paths, reason, cooldown_minutes=60, live_dir=None, force_switch=False)`
+- `poll_quota_logs(paths, ...)`
+- `watch_quota_logs(paths, ...)`
+- `parse_quota_log_line(line)`
 - `set_switch_mode(paths, mode)`
 - `set_live_dir(paths, live_dir)`
 - `update_account_runtime_metadata(paths, name, ...)`
 
 Important returned state:
 
-- `get_status_snapshot(paths)` includes `switch_runtime`
+- `get_status_snapshot(paths)` includes `switch_runtime` and `log_watch`
 - `ensure_active_account(...)` reports the active account decision
 - `rotate_after_failure(...)` returns a `RotationResult` with `outcome`
 
