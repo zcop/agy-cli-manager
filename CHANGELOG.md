@@ -7,6 +7,10 @@
 - persist log cursors in `log-watch.json` so historical quota errors are not replayed
 - replace the watch diagram with a simple 3-step `gpt-image-2` image in `docs/quota-log-watch.png`
 - use `msvcrt` file locking on Windows so the manager can import without `fcntl`
+- arm a log-triggered switch only once per producing `agy` session so leftover quota lines cannot burn standby accounts
+- initialize existing logs at EOF; only files created after watcher start are read from offset 0
+- lock and atomically replace `log-watch.json` so dashboard and `watch` cannot clobber cursors
+- add `agy-cli-manager ack-restart` (dashboard `Y`) to clear `restart_required` after `agy` is restarted
 
 ## v0.2.1 - 2026-07-15
 

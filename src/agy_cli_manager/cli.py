@@ -48,6 +48,7 @@ from agy_cli_manager.manager import (
     verify_accounts,
 )
 from agy_cli_manager.watch import (
+    clear_restart_required,
     format_watch_poll,
     poll_quota_logs,
     watch_quota_logs,
@@ -180,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--cooldown-minutes", type=int, default=60)
     watch.add_argument("--on-rotate", help="Shell command to run after a successful switch")
     watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    ack_restart = sub.add_parser(
+        "ack-restart",
+        help="Acknowledge that agy was restarted after a log-watch account switch",
+    )
+    ack_restart.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     update_meta = sub.add_parser("update-meta", help="Update cached runtime metadata for an account")
     update_meta.add_argument("name")
@@ -764,6 +771,7 @@ def _draw_action_bar(stdscr, y: int) -> int:
         ("C", "ClearBad"),
         ("M", "MarkBad"),
         ("W", "Mode"),
+        ("Y", "AckRestart"),
         ("S", "Sort"),
         ("U", "Live Usage Refresh"),
         ("T", "UI Refresh"),
@@ -1627,6 +1635,12 @@ def _dashboard(stdscr, paths) -> int:
             continue
         if key in (ord("p"), ord("P")):
             return _proxy_dashboard(stdscr, paths)
+        if key in (ord("y"), ord("Y")):
+            clear_restart_required(paths)
+            snapshot = _refresh_dashboard_snapshot(paths)
+            last_refresh = time.time()
+            message = "Acknowledged agy restart; log-watch can rotate again."
+            continue
         if not accounts:
             message = "No accounts available for this action."
             continue
@@ -2176,6 +2190,17 @@ def main() -> int:
                     print(f"marked-bad-no-standby: {result.previous_active}")
                 else:
                     print("no-active-account")
+            return 0
+        if args.command == "ack-restart":
+            state = clear_restart_required(paths)
+            if args.json:
+                print(json.dumps({
+                    "restart_required": bool(state.get("restart_required")),
+                    "restart_armed_at": state.get("restart_armed_at"),
+                    "restart_armed_account": state.get("restart_armed_account"),
+                }, indent=2, sort_keys=True))
+            else:
+                print("restart-acknowledged")
             return 0
         if args.command == "watch":
             return watch_quota_logs(

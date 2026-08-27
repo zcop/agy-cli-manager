@@ -137,7 +137,7 @@ With no subcommand, the full-screen dashboard opens by default.
 
 ### 5. Auto-switch when quota is full
 
-When `agy` hits **Individual quota reached**, the manager switches to the next account. Restart `agy` after that.
+When `agy` hits **Individual quota reached**, the manager switches to the next account. Restart `agy` after that. The old process may keep writing quota errors; those lines do not rotate again until you acknowledge the restart or a new session log appears.
 
 ![Quota full? Switch accounts.](docs/quota-log-watch.png)
 
@@ -146,7 +146,13 @@ agy-cli-manager switch-mode auto
 agy-cli-manager watch
 ```
 
-Leave the dashboard open instead of `watch` if you prefer. Do not pass `--from-start` unless you intend to replay old quota errors.
+After restarting `agy`:
+
+```bash
+agy-cli-manager ack-restart
+```
+
+Leave the dashboard open instead of `watch` if you prefer (`Y` acknowledges the restart). Do not pass `--from-start` unless you intend to replay old quota errors.
 
 ## First Useful Commands
 
@@ -165,6 +171,7 @@ agy-cli-manager switch-next
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
 agy-cli-manager watch
 agy-cli-manager watch --once --json
+agy-cli-manager ack-restart
 ```
 
 The current switch policy is stored in manager state and can be controlled by either:
