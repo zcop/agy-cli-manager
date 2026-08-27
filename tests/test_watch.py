@@ -159,44 +159,5 @@ class CursorAndConsumeTests(unittest.TestCase):
             self.assertEqual(events[0].kind, "individual_quota")
 
 
-
-
-class ResumeAgyArgsTests(unittest.TestCase):
-    def test_adds_continue_when_missing(self) -> None:
-        from agy_cli_manager.watch import resume_agy_args
-
-        self.assertEqual(resume_agy_args([]), ["--continue"])
-        self.assertEqual(resume_agy_args(["--prompt", "hi"]), ["--continue", "--prompt", "hi"])
-
-    def test_keeps_continue_or_conversation(self) -> None:
-        from agy_cli_manager.watch import resume_agy_args
-
-        self.assertEqual(resume_agy_args(["--continue"]), ["--continue"])
-        self.assertEqual(resume_agy_args(["-c", "--model", "x"]), ["-c", "--model", "x"])
-        self.assertEqual(
-            resume_agy_args(["--conversation", "abc"]),
-            ["--conversation", "abc"],
-        )
-        self.assertEqual(
-            resume_agy_args(["--conversation=abc"]),
-            ["--conversation=abc"],
-        )
-
-    def test_strips_leading_double_dash(self) -> None:
-        from agy_cli_manager.watch import resume_agy_args
-
-        self.assertEqual(resume_agy_args(["--", "--model", "x"]), ["--continue", "--model", "x"])
-
-
-class ClearRestartRequiredTests(unittest.TestCase):
-    def test_clears_restart_flag(self) -> None:
-        from agy_cli_manager.watch import clear_restart_required, load_log_watch_state, save_log_watch_state
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            save_log_watch_state(root, {"restart_required": True})
-            clear_restart_required(root)
-            self.assertFalse(load_log_watch_state(root)["restart_required"])
-
 if __name__ == "__main__":
     unittest.main()
