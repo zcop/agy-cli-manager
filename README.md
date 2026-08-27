@@ -135,20 +135,18 @@ agy-cli-manager
 
 With no subcommand, the full-screen dashboard opens by default.
 
-### 5. Watch live `agy` quota errors
+### 5. Auto-switch when quota is full
 
-`agy` never calls the manager. `switch-mode auto` plus `ensure-active` / `refresh-due` only see cached Cloud Code usage. The TUI banner `Individual quota reached` is written to `~/.gemini/antigravity-cli/log/cli-*.log`.
+When `agy` hits **Individual quota reached**, the manager switches to the next account. Restart `agy` after that.
 
-![Quota log watch](docs/quota-log-watch.svg)
-
-Leave the dashboard open, or run a dedicated watcher:
+![Quota full? Switch accounts.](docs/quota-log-watch.png)
 
 ```bash
 agy-cli-manager switch-mode auto
 agy-cli-manager watch
 ```
 
-On a match the watcher calls `rotate-after-failure --reason quota --trigger log-watch`. A running `agy` process keeps the old token in memory, so restart it after a switch. `--on-rotate` can run a helper command after a successful failover. Do not pass `--from-start` unless you intend to replay historical quota errors.
+Leave the dashboard open instead of `watch` if you prefer. Do not pass `--from-start` unless you intend to replay old quota errors.
 
 ## First Useful Commands
 

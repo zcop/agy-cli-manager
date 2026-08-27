@@ -1,108 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
-  <title id="title">agy-cli-manager quota log watch</title>
-  <desc id="desc">How the manager fails over when the live agy TUI writes Individual quota reached to Antigravity CLI logs.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc">
+  <title id="title">Quota full? Switch accounts.</title>
+  <desc id="desc">Three steps: quota full, switch account, restart agy.</desc>
   <style>
     .mono { font-family: "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace; }
+    .sans { font-family: "Segoe UI", "DejaVu Sans", Arial, sans-serif; }
     .fg { fill: #f2f6fb; }
     .muted { fill: #9aa7b5; }
-    .green { fill: #5fd75f; }
-    .yellow { fill: #ffd75f; }
-    .red { fill: #ff5f5f; }
-    .cyan { fill: #5fd7ff; }
-    .blue { fill: #5f87ff; }
-    .magenta { fill: #d787ff; }
-    .title { font-size: 26px; }
-    .line { font-size: 22px; }
-    .small { font-size: 18px; }
-    .tiny { font-size: 16px; }
-    .card { fill: #151b24; stroke: #2a3440; stroke-width: 2; }
-    .card-cyan { fill: #102028; stroke: #5fd7ff; stroke-width: 2; }
-    .card-red { fill: #241418; stroke: #ff5f5f; stroke-width: 2; }
-    .card-green { fill: #142414; stroke: #5fd75f; stroke-width: 2; }
-    .card-yellow { fill: #242014; stroke: #ffd75f; stroke-width: 2; }
+    .title { font-size: 42px; font-weight: 700; }
+    .card-title { font-size: 36px; font-weight: 700; }
+    .card-body { font-size: 22px; }
+    .footer { font-size: 22px; }
   </style>
 
-  <rect width="1600" height="980" fill="#0b0f14"/>
-  <rect x="34" y="28" width="1532" height="924" rx="16" fill="#10151c"/>
-  <rect x="34" y="28" width="1532" height="36" rx="16" fill="#1a2028"/>
-  <circle cx="62" cy="46" r="6" fill="#ff605c"/>
-  <circle cx="82" cy="46" r="6" fill="#ffbd44"/>
-  <circle cx="102" cy="46" r="6" fill="#00ca4e"/>
-  <text x="130" y="53" class="mono small muted">agy-cli-manager watch  |  trigger=log-watch</text>
+  <rect width="1600" height="720" fill="#0b0f14"/>
+  <text x="800" y="88" text-anchor="middle" class="sans title fg">Quota full? Switch accounts.</text>
 
-  <text x="52" y="100" class="mono title fg">Quota log watch</text>
-  <text x="52" y="132" class="mono line muted">agy never calls the manager. Cached Cloud Code usage is advisory. The TUI banner is the failover signal.</text>
+  <rect x="64" y="160" width="400" height="380" rx="28" fill="#3a1418" stroke="#ff5f5f" stroke-width="3"/>
+  <text x="264" y="250" text-anchor="middle" class="sans card-title" fill="#ff8a8a">1. Quota full</text>
+  <text x="264" y="330" text-anchor="middle" class="sans card-body fg">agy hits</text>
+  <text x="264" y="368" text-anchor="middle" class="sans card-body fg">Individual quota reached</text>
 
-  <!-- stage 1 -->
-  <rect x="52" y="168" width="360" height="168" rx="12" class="card-red"/>
-  <text x="72" y="204" class="mono line red">1. agy TUI</text>
-  <text x="72" y="236" class="mono small fg">live Antigravity chat</text>
-  <text x="72" y="268" class="mono small yellow">RESOURCE_EXHAUSTED 429</text>
-  <text x="72" y="296" class="mono small fg">Individual quota reached</text>
-  <text x="72" y="320" class="mono tiny muted">Resets in ~2h</text>
+  <polygon points="494,350 544,330 544,370" fill="#5fd7ff"/>
 
-  <path d="M412 252 H468" stroke="#5fd7ff" stroke-width="3" fill="none"/>
-  <polygon points="468,246 484,252 468,258" fill="#5fd7ff"/>
-  <text x="418" y="242" class="mono tiny cyan">writes</text>
+  <rect x="564" y="160" width="400" height="380" rx="28" fill="#102028" stroke="#5fd7ff" stroke-width="3"/>
+  <text x="764" y="250" text-anchor="middle" class="sans card-title" fill="#5fd7ff">2. Switch account</text>
+  <text x="764" y="330" text-anchor="middle" class="sans card-body fg">watch copies the next</text>
+  <text x="764" y="368" text-anchor="middle" class="sans card-body fg">login onto disk</text>
 
-  <!-- stage 2 -->
-  <rect x="492" y="168" width="430" height="168" rx="12" class="card-cyan"/>
-  <text x="512" y="204" class="mono line cyan">2. CLI log files</text>
-  <text x="512" y="236" class="mono small fg">~/.gemini/antigravity-cli/log/</text>
-  <text x="512" y="264" class="mono small fg">cli-*.log  +  cli.log</text>
-  <text x="512" y="296" class="mono small yellow">cursors start at EOF</text>
-  <text x="512" y="320" class="mono tiny muted">state: log-watch.json</text>
+  <polygon points="994,350 1044,330 1044,370" fill="#5fd75f"/>
 
-  <path d="M922 252 H978" stroke="#5fd7ff" stroke-width="3" fill="none"/>
-  <polygon points="978,246 994,252 978,258" fill="#5fd7ff"/>
-  <text x="928" y="242" class="mono tiny cyan">tail</text>
+  <rect x="1064" y="160" width="472" height="380" rx="28" fill="#142414" stroke="#5fd75f" stroke-width="3"/>
+  <text x="1300" y="250" text-anchor="middle" class="sans card-title" fill="#5fd75f">3. Restart agy</text>
+  <text x="1300" y="330" text-anchor="middle" class="sans card-body fg">new chat uses</text>
+  <text x="1300" y="368" text-anchor="middle" class="sans card-body fg">the new account</text>
 
-  <!-- stage 3 -->
-  <rect x="1002" y="168" width="540" height="168" rx="12" class="card"/>
-  <text x="1022" y="204" class="mono line fg">3. watch / dashboard</text>
-  <text x="1022" y="236" class="mono small fg">poll every 1s</text>
-  <text x="1022" y="264" class="mono small cyan">parse_quota_log_line()</text>
-  <text x="1022" y="296" class="mono small green">match quota banner</text>
-  <text x="1022" y="320" class="mono tiny muted">ignore quota_manager.go refresh</text>
-
-  <!-- match rules -->
-  <rect x="52" y="364" width="1490" height="110" rx="12" class="card"/>
-  <text x="72" y="400" class="mono line magenta">Matchers</text>
-  <text x="72" y="432" class="mono small fg">HIT  Individual quota reached   |   RESOURCE_EXHAUSTED (code 429) + quota reached   |   weekly quota reached</text>
-  <text x="72" y="456" class="mono small muted">MISS unrelated 429s, doRefreshQuota, and any history already behind the byte cursor. --from-start replays old quota storms.</text>
-
-  <!-- decision -->
-  <polygon points="800,518 930,568 800,618 670,568" fill="#242014" stroke="#ffd75f" stroke-width="2"/>
-  <text x="800" y="564" text-anchor="middle" class="mono small yellow">switch-mode</text>
-  <text x="800" y="586" text-anchor="middle" class="mono small yellow">auto?</text>
-
-  <path d="M670 568 H430" stroke="#5fd75f" stroke-width="3" fill="none"/>
-  <polygon points="430,562 414,568 430,574" fill="#5fd75f"/>
-  <text x="500" y="556" class="mono tiny green">YES / --force-switch</text>
-
-  <path d="M930 568 H1170" stroke="#9aa7b5" stroke-width="3" fill="none"/>
-  <polygon points="1170,562 1186,568 1170,574" fill="#9aa7b5"/>
-  <text x="980" y="556" class="mono tiny muted">NO  manual</text>
-
-  <!-- yes path -->
-  <rect x="52" y="640" width="720" height="250" rx="12" class="card-green"/>
-  <text x="72" y="676" class="mono line green">rotate-after-failure</text>
-  <text x="72" y="708" class="mono small fg">reason=quota   trigger=log-watch</text>
-  <text x="72" y="736" class="mono small fg">1. mark active bad, cooldown 60m</text>
-  <text x="72" y="764" class="mono small fg">2. copy standby profile into live ~/.gemini</text>
-  <text x="72" y="792" class="mono small fg">3. persist restart_required</text>
-  <text x="72" y="820" class="mono small yellow">4. running agy still has the old token</text>
-  <text x="72" y="848" class="mono small cyan">5. restart agy  |  optional --on-rotate hook</text>
-  <text x="72" y="872" class="mono tiny muted">example: acct-primary  -&gt;  acct-standby</text>
-
-  <!-- no path -->
-  <rect x="820" y="640" width="722" height="250" rx="12" class="card"/>
-  <text x="840" y="676" class="mono line muted">manual mode</text>
-  <text x="840" y="708" class="mono small fg">quota error is recorded</text>
-  <text x="840" y="736" class="mono small fg">active account stays in place</text>
-  <text x="840" y="764" class="mono small fg">header can still show LogWatch: on</text>
-  <text x="840" y="792" class="mono small yellow">operator rotates with R / rotate</text>
-  <text x="840" y="820" class="mono small cyan">or: watch --force-switch</text>
-  <text x="840" y="848" class="mono tiny muted">dashboard W toggles auto / manual</text>
-  <text x="840" y="872" class="mono tiny muted">do not pass --from-start on a machine with old quota logs</text>
+  <text x="800" y="640" text-anchor="middle" class="mono footer muted">Run: agy-cli-manager watch</text>
 </svg>
