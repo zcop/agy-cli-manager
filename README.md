@@ -137,16 +137,24 @@ With no subcommand, the full-screen dashboard opens by default.
 
 ### 5. Auto-switch when quota is full
 
-When `agy` hits **Individual quota reached**, the manager switches to the next account. Restart `agy` after that.
+When `agy` hits **Individual quota reached**, the manager switches to the next account and keeps the same chat going.
+
+`agy` cannot hot-reload a Google login. `run` does the next-best thing: switch the account on disk, stop that `agy`, and start it again with `--continue`.
 
 ![Quota full? Switch accounts.](docs/quota-log-watch.png)
 
 ```bash
 agy-cli-manager switch-mode auto
-agy-cli-manager watch
+agy-cli-manager run
 ```
 
-Leave the dashboard open instead of `watch` if you prefer. Do not pass `--from-start` unless you intend to replay old quota errors.
+Resume a known chat:
+
+```bash
+agy-cli-manager run -- --conversation <conversation-id>
+```
+
+`watch` or the dashboard still switch the account on disk if you launched `agy` yourself. That process keeps the old token until it exits. Do not pass `--from-start` unless you intend to replay old quota errors.
 
 ## First Useful Commands
 
@@ -163,6 +171,7 @@ agy-cli-manager switch-policy --short-threshold 10 --refresh-failure-threshold 2
 agy-cli-manager refresh-usage --json
 agy-cli-manager switch-next
 agy-cli-manager rotate-after-failure --reason quota --cooldown-minutes 60 --json
+agy-cli-manager run
 agy-cli-manager watch
 agy-cli-manager watch --once --json
 ```

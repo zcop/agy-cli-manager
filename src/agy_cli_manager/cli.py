@@ -50,6 +50,7 @@ from agy_cli_manager.manager import (
 from agy_cli_manager.watch import (
     format_watch_poll,
     poll_quota_logs,
+    run_agy_with_quota_failover,
     watch_quota_logs,
 )
 
@@ -180,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--cooldown-minutes", type=int, default=60)
     watch.add_argument("--on-rotate", help="Shell command to run after a successful switch")
     watch.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    run = sub.add_parser("run", help="Run agy and continue the same chat after quota failover")
+    run.add_argument("--agy-binary", help="Path to the agy binary")
+    run.add_argument("--poll-seconds", type=float, default=1.0, help="Log poll interval in seconds")
+    run.add_argument("--cooldown-minutes", type=int, default=60)
+    run.add_argument("--force-switch", action="store_true", help="Switch even if the manager is in manual mode")
+    run.add_argument("agy_args", nargs=argparse.REMAINDER, help="Arguments forwarded to agy")
 
     update_meta = sub.add_parser("update-meta", help="Update cached runtime metadata for an account")
     update_meta.add_argument("name")
@@ -2189,6 +2197,15 @@ def main() -> int:
                 cooldown_minutes=args.cooldown_minutes,
                 on_rotate=args.on_rotate,
                 as_json=args.json,
+            )
+        if args.command == "run":
+            return run_agy_with_quota_failover(
+                paths,
+                args.agy_args,
+                agy_binary=args.agy_binary,
+                poll_seconds=args.poll_seconds,
+                cooldown_minutes=args.cooldown_minutes,
+                force_switch=args.force_switch,
             )
         if args.command == "update-meta":
             meta = update_account_runtime_metadata(

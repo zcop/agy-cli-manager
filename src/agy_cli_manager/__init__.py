@@ -30,6 +30,7 @@ from agy_cli_manager.manager import (
 from agy_cli_manager.watch import (
     parse_quota_log_line,
     poll_quota_logs,
+    run_agy_with_quota_failover,
     watch_quota_logs,
 )
 
@@ -61,5 +62,6 @@ __all__ = [
     "clear_account_proxy",
     "parse_quota_log_line",
     "poll_quota_logs",
+    "run_agy_with_quota_failover",
     "watch_quota_logs",
 ]

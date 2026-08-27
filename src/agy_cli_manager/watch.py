@@ -8,14 +8,15 @@ quota banner as the failover signal.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
+from typing import Any, Sequence
 
 DEFAULT_WATCH_POLL_SECONDS = 1.0
 DEFAULT_WATCH_COOLDOWN_MINUTES = 60
@@ -410,3 +411,115 @@ def watch_quota_logs(
         if once or not follow:
             return 0
         time.sleep(interval)
+
+
+def resume_agy_args(argv: Sequence[str]) -> list[str]:
+    args = [str(arg) for arg in argv]
+    if args[:1] == ["--"]:
+        args = args[1:]
+    for arg in args:
+        if arg in {"-c", "--continue"}:
+            return args
+        if arg == "--conversation" or arg.startswith("--conversation="):
+            return args
+    return ["--continue", *args]
+
+
+def clear_restart_required(root: Path) -> None:
+    state = load_log_watch_state(root)
+    if not state.get("restart_required"):
+        return
+    state["restart_required"] = False
+    save_log_watch_state(root, state)
+
+
+def _stop_agy_process(proc: subprocess.Popen[Any], *, timeout: float = 8.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def run_agy_with_quota_failover(
+    paths: Any,
+    agy_args: Sequence[str] | None = None,
+    *,
+    agy_binary: str | None = None,
+    poll_seconds: float = DEFAULT_WATCH_POLL_SECONDS,
+    cooldown_minutes: int = DEFAULT_WATCH_COOLDOWN_MINUTES,
+    force_switch: bool = False,
+    printer=print,
+) -> int:
+    from agy_cli_manager.manager import (
+        _agy_subprocess_env,
+        apply_active,
+        get_live_dir,
+        load_state,
+        resolve_agy_binary,
+    )
+
+    interval = poll_seconds if poll_seconds > 0 else DEFAULT_WATCH_POLL_SECONDS
+    original_args = [str(arg) for arg in (agy_args or ())]
+    if original_args[:1] == ["--"]:
+        original_args = original_args[1:]
+    binary = resolve_agy_binary(agy_binary)
+    session = 0
+    proc: subprocess.Popen[Any] | None = None
+
+    printer("agy-cli-manager run: quota full -> switch account -> continue same chat")
+    try:
+        while True:
+            active = apply_active(paths)
+            state = load_state(paths)
+            live_dir = get_live_dir(state)
+            if live_dir is None:
+                raise ValueError("No live Antigravity directory is set.")
+            argv = list(original_args) if session == 0 else resume_agy_args(original_args)
+            env = _agy_subprocess_env(live_dir.parent)
+            if session > 0:
+                clear_restart_required(paths.root)
+                printer(f"restarting agy as {active} with {' '.join(argv) or '--continue'}")
+            else:
+                printer(f"starting agy as {active}")
+            proc = subprocess.Popen(
+                [binary, *argv],
+                stdin=sys.stdin,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                cwd=os.getcwd(),
+                env=env,
+            )
+            rotated = False
+            while proc.poll() is None:
+                result = poll_quota_logs(
+                    paths,
+                    rotate=True,
+                    force_switch=force_switch,
+                    cooldown_minutes=cooldown_minutes,
+                )
+                if result.rotated:
+                    rotated = True
+                    printer(result.message)
+                    printer("quota full; switching account and continuing")
+                    _stop_agy_process(proc)
+                    break
+                try:
+                    proc.wait(timeout=interval)
+                except subprocess.TimeoutExpired:
+                    pass
+            if rotated:
+                session += 1
+                continue
+            code = proc.returncode if proc.returncode is not None else 0
+            return int(code)
+    except KeyboardInterrupt:
+        if proc is not None:
+            _stop_agy_process(proc)
+        return 130
+    finally:
+        if proc is not None and proc.poll() is None:
+            _stop_agy_process(proc)
