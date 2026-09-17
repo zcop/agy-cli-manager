@@ -460,10 +460,30 @@ def _remove_managed_profile_files(target: Path) -> None:
         (target / name).unlink(missing_ok=True)
 
 
-def _copy_account_profile(source_dir: Path, target_home: Path) -> None:
+def _copy_account_profile(
+    source_dir: Path, target_home: Path, *, force: bool = False, to_live: bool = False
+) -> None:
     profile_source = _resolve_profile_source(source_dir)
     target_profile = target_home / ".gemini"
     _copy_managed_profile_files(profile_source, target_profile)
+    if os.name != "nt":
+        return
+    from agy_cli_manager.credential_store import (
+        WindowsCredentialStore,
+        apply_to_live,
+        copy_slot,
+        live_target,
+    )
+
+    source_target = _windows_cred_target(source_dir)
+    if not source_target or not WindowsCredentialStore(source_target).exists():
+        return
+    if to_live:
+        apply_to_live(source_target, force=force)
+        return
+    dest_target = _windows_cred_target(target_home)
+    if dest_target and dest_target != live_target():
+        copy_slot(source_target, dest_target)
 
 
 def _resolve_profile_source(source_dir: Path) -> Path:
@@ -481,6 +501,79 @@ def _resolve_home_source(source_dir: Path) -> Path:
     if source_dir.name == ".gemini":
         return source_dir.parent
     return source_dir
+
+
+def _windows_account_name(path: Path) -> str | None:
+    try:
+        parts = path.expanduser().resolve().parts
+    except OSError:
+        parts = path.parts
+    for index, part in enumerate(parts):
+        if part == "accounts" and index + 1 < len(parts):
+            name = parts[index + 1]
+            if name and name != ".gemini":
+                return name
+    return None
+
+
+def _windows_is_runtime_dir(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path
+    if resolved.name == ".gemini":
+        resolved = resolved.parent
+    return resolved.name == "runtime" and (resolved.parent / "accounts").is_dir()
+
+
+def _windows_looks_like_live(path: Path) -> bool:
+    live = default_live_dir()
+    try:
+        resolved = path.expanduser().resolve()
+        live_resolved = live.expanduser().resolve()
+    except OSError:
+        return False
+    return resolved in {live_resolved, live_resolved.parent}
+
+
+def _windows_cred_target(path: Path) -> str | None:
+    from agy_cli_manager.credential_store import live_target, profile_target
+
+    name = _windows_account_name(path)
+    if name:
+        return profile_target(name)
+    if _windows_is_runtime_dir(path):
+        return profile_target("runtime")
+    if _windows_looks_like_live(path):
+        return live_target()
+    return None
+
+
+def _windows_preserve_live() -> str | None:
+    from agy_cli_manager.credential_store import (
+        WindowsCredentialStore,
+        copy_slot,
+        live_target,
+        profile_target,
+    )
+
+    live = live_target()
+    if not WindowsCredentialStore(live).exists():
+        return None
+    backup = profile_target("backup:live")
+    copy_slot(live, backup, reuse_dest_envelope=False)
+    WindowsCredentialStore(live).delete()
+    return backup
+
+
+def _windows_finish_backup(backup_target: str | None, *, restore: bool) -> None:
+    if not backup_target:
+        return
+    from agy_cli_manager.credential_store import WindowsCredentialStore, apply_to_live
+
+    if restore:
+        apply_to_live(backup_target, force=True)
+    WindowsCredentialStore(backup_target).delete()
 
 
 def utc_now() -> datetime:
@@ -594,6 +687,23 @@ def _project_id_path(home_root: Path) -> Path:
 def _load_antigravity_token_state(home_root: Path) -> dict:
     path = _oauth_token_path(home_root)
     data = _read_json_if_exists(path)
+    if isinstance(data, dict) and isinstance(data.get("token"), dict):
+        return data
+    if os.name == "nt":
+        from agy_cli_manager.credential_store import WindowsCredentialStore
+
+        target = _windows_cred_target(home_root)
+        if target:
+            store = WindowsCredentialStore(target)
+            if store.exists():
+                try:
+                    parsed = json.loads(store.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and isinstance(parsed.get("token"), dict):
+                    return parsed
+                if isinstance(parsed, dict) and "access_token" in parsed:
+                    return {"token": parsed}
     if not isinstance(data, dict):
         raise ValueError(f"Antigravity token file not found or invalid: {path}")
     token = data.get("token")
@@ -1715,6 +1825,22 @@ def resolve_login_profile_identity(
 
 
 def profile_has_login_artifacts(profile_dir: Path) -> bool:
+    if os.name == "nt":
+        from agy_cli_manager.credential_store import (
+            WindowsCredentialStore,
+            migrate_legacy_json,
+            profile_target,
+        )
+
+        name = _windows_account_name(profile_dir)
+        if name:
+            account_path = profile_dir.parent if profile_dir.name == ".gemini" else profile_dir
+            migrate_legacy_json(account_path, name)
+            if WindowsCredentialStore(profile_target(name)).exists():
+                return True
+        target = _windows_cred_target(profile_dir)
+        if target and WindowsCredentialStore(target).exists():
+            return True
     return any(
         all((profile_dir / name).is_file() for name in artifact_set)
         for artifact_set in LOGIN_ARTIFACT_SETS
@@ -1899,7 +2025,7 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     return state
 
 
-def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overwrite: bool = False) -> None:
+def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overwrite: bool = False, *, force: bool = False) -> None:
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
     source_dir = source_dir.resolve()
@@ -1952,13 +2078,13 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
         if overwrite and state.get("active") == name:
             _copy_active_runtime(paths, name)
             state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
+            _sync_runtime_to_live_dir(paths, state, force=force)
         save_state(paths, state)
         if not state.get("active"):
             _copy_active_runtime(paths, name)
             state["active"] = name
             state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
+            _sync_runtime_to_live_dir(paths, state, force=force)
             save_state(paths, state)
 
 
@@ -1986,14 +2112,14 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
     _copy_account_profile(src, paths.runtime_dir)
 
 
-def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
+def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict, *, force: bool = False) -> None:
     live_dir = get_live_dir(state)
     if live_dir is None:
         return
-    _copy_account_profile(paths.runtime_dir, live_dir.parent)
+    _copy_account_profile(paths.runtime_dir, live_dir.parent, force=force, to_live=True)
 
 
-def switch_account(paths: ManagerPaths, name: str) -> str:
+def switch_account(paths: ManagerPaths, name: str, *, force: bool = False) -> str:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         meta = state["accounts"].get(name)
@@ -2009,7 +2135,7 @@ def switch_account(paths: ManagerPaths, name: str) -> str:
         _copy_active_runtime(paths, name)
         state["active"] = name
         state = sync_state_from_disk(paths, state)
-        _sync_runtime_to_live_dir(paths, state)
+        _sync_runtime_to_live_dir(paths, state, force=force)
         save_state(paths, state)
         return previous or ""
 
@@ -2546,6 +2672,8 @@ def login_account(
     name: str,
     agy_binary: str | None,
     timeout_seconds: int = 600,
+    *,
+    force: bool = False,
 ) -> str | None:
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
@@ -2559,76 +2687,105 @@ def login_account(
         state["live_dir"] = str(live_dir.resolve())
         save_state(paths, state)
 
-    runtime_home = live_dir.parent
-    runtime_home.mkdir(parents=True, exist_ok=True)
-    _remove_managed_profile_files(live_dir)
-
-    env = os.environ.copy()
-    env["HOME"] = str(runtime_home)
-    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    backup_target = None
     try:
-        proc = subprocess.Popen(
-            [resolved_binary],
-            stdin=sys.stdin,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            cwd=runtime_home,
-            env=env,
-            close_fds=True,
-        )
-    except FileNotFoundError as exc:
-        raise ValueError(f"agy binary not found: {resolved_binary}") from exc
+        if os.name == "nt":
+            from agy_cli_manager.credential_store import assert_live_slot_idle
 
-    start_time = time.time()
-    print("Launching real agy login session.")
-    print("Complete onboarding/login there, then exit agy to save the profile.")
-    sys.stdout.flush()
-    try:
-        while True:
-            if proc.poll() is not None:
-                break
-            if time.time() - start_time > timeout_seconds:
+            if not force:
+                assert_live_slot_idle()
+            backup_target = _windows_preserve_live()
+
+        runtime_home = live_dir.parent
+        runtime_home.mkdir(parents=True, exist_ok=True)
+        _remove_managed_profile_files(live_dir)
+
+        env = os.environ.copy()
+        env["HOME"] = str(runtime_home)
+        popen_kwargs = {
+            "stdin": sys.stdin,
+            "stdout": sys.stdout,
+            "stderr": sys.stderr,
+            "cwd": runtime_home,
+            "env": env,
+        }
+        if os.name != "nt":
+            env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+            popen_kwargs["close_fds"] = True
+        try:
+            proc = subprocess.Popen([resolved_binary], **popen_kwargs)
+        except FileNotFoundError as exc:
+            raise ValueError(f"agy binary not found: {resolved_binary}") from exc
+
+        start_time = time.time()
+        print("Launching real agy login session.")
+        print("Complete onboarding/login there, then exit agy to save the profile.")
+        sys.stdout.flush()
+        try:
+            while True:
+                if proc.poll() is not None:
+                    break
+                if time.time() - start_time > timeout_seconds:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            raise
+
+        if os.name == "nt":
+            from agy_cli_manager.credential_store import WindowsCredentialStore, live_target
+
+            if not profile_has_login_artifacts(live_dir) and not WindowsCredentialStore(live_target()).exists():
+                raise ValueError("agy login did not produce a usable auth profile.")
+        elif not live_dir.is_dir() or not profile_has_login_artifacts(live_dir):
+            raise ValueError("agy login did not produce a usable auth profile.")
+
+        identity = resolve_login_profile_identity(live_dir, agy_binary=resolved_binary, live_dir=live_dir)
+        detected_name = identity.get("account_name")
+        # The caller's name is the stable profile label.  Keep detected identity
+        # as metadata so two profiles from the same or changing login identity do
+        # not collapse onto one storage directory.
+        storage_name = normalize_account_storage_name(name)
+        if detected_name and storage_name != name:
+            print(f"detected-account: {detected_name}")
+            print(f"storage-name: {storage_name}")
+
+        overwrite = False
+        if account_dir(paths, storage_name).exists():
+            prompt = f"Account '{storage_name}' already exists. Overwrite it? [y/N]: "
+            answer = input(prompt).strip().lower()
+            if answer not in {"y", "yes"}:
+                storage_name = next_available_account_name(paths, storage_name)
+                print(f"saving-as: {storage_name}")
+            else:
+                overwrite = True
+
+        save_account_profile(paths, storage_name, runtime_home, overwrite=overwrite, force=force)
+        if os.name == "nt":
+            from agy_cli_manager.credential_store import (
+                WindowsCredentialStore,
+                copy_slot,
+                live_target,
+                profile_target,
+            )
+
+            if WindowsCredentialStore(live_target()).exists():
+                copy_slot(live_target(), profile_target(storage_name), reuse_dest_envelope=False)
+        _windows_finish_backup(backup_target, restore=False)
+        return storage_name
+    except BaseException:
+        _windows_finish_backup(backup_target, restore=True)
         raise
-
-    if not live_dir.is_dir() or not profile_has_login_artifacts(live_dir):
-        raise ValueError("agy login did not produce a usable auth profile.")
-
-    identity = resolve_login_profile_identity(live_dir, agy_binary=resolved_binary, live_dir=live_dir)
-    detected_name = identity.get("account_name")
-    # The caller's name is the stable profile label.  Keep detected identity
-    # as metadata so two profiles from the same or changing login identity do
-    # not collapse onto one storage directory.
-    storage_name = normalize_account_storage_name(name)
-    if detected_name and storage_name != name:
-        print(f"detected-account: {detected_name}")
-        print(f"storage-name: {storage_name}")
-
-    overwrite = False
-    if account_dir(paths, storage_name).exists():
-        prompt = f"Account '{storage_name}' already exists. Overwrite it? [y/N]: "
-        answer = input(prompt).strip().lower()
-        if answer not in {"y", "yes"}:
-            storage_name = next_available_account_name(paths, storage_name)
-            print(f"saving-as: {storage_name}")
-        else:
-            overwrite = True
-
-    save_account_profile(paths, storage_name, runtime_home, overwrite=overwrite)
-    return storage_name
 
 
 def format_status(paths: ManagerPaths) -> str:

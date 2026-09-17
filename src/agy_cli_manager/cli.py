@@ -136,11 +136,14 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("name", nargs="?")
     login.add_argument("--agy-binary")
     login.add_argument("--timeout-seconds", type=int, default=600)
+    login.add_argument("--force", action="store_true", help="Override live-slot process guard")
 
     switch = sub.add_parser("switch", help="Switch to a named account")
     switch.add_argument("name")
+    switch.add_argument("--force", action="store_true", help="Override live-slot process guard")
     activate = sub.add_parser("activate", help="Alias for switch")
     activate.add_argument("name")
+    activate.add_argument("--force", action="store_true", help="Override live-slot process guard")
 
     sub.add_parser("switch-next", help="Switch to the next enabled standby account")
     rotate_cmd = sub.add_parser("rotate", help="Alias for switch-next")
@@ -233,9 +236,10 @@ def run_login_with_prompt(
     name: str,
     agy_binary: str | None,
     timeout_seconds: int,
+    force: bool = False,
 ) -> str | None:
     try:
-        return login_account(paths, name, agy_binary, timeout_seconds)
+        return login_account(paths, name, agy_binary, timeout_seconds, force=force)
     except ValueError as exc:
         message = str(exc)
         if "agy binary not found" not in message or not sys.stdin.isatty():
@@ -244,7 +248,7 @@ def run_login_with_prompt(
         retry_binary = prompt_optional_text("agy binary path")
         if not retry_binary:
             raise ValueError("agy binary path is required.")
-        return login_account(paths, name, retry_binary, timeout_seconds)
+        return login_account(paths, name, retry_binary, timeout_seconds, force=force)
 
 
 def run_menu(paths, parser: argparse.ArgumentParser) -> int:
@@ -2105,18 +2109,18 @@ def main() -> int:
             return 0
         if args.command == "login":
             name = args.name or prompt_nonempty("Account name")
-            stored_name = run_login_with_prompt(paths, name, args.agy_binary, args.timeout_seconds)
+            stored_name = run_login_with_prompt(paths, name, args.agy_binary, args.timeout_seconds, force=args.force)
             print(f"{'logged-in' if stored_name else 'cancelled'}: {stored_name or name}")
             return 0
         if args.command == "switch":
-            previous = switch_account(paths, args.name)
+            previous = switch_account(paths, args.name, force=args.force)
             if previous:
                 print(f"switched: {previous} -> {args.name}")
             else:
                 print(f"switched: {args.name}")
             return 0
         if args.command == "activate":
-            previous = switch_account(paths, args.name)
+            previous = switch_account(paths, args.name, force=args.force)
             if previous:
                 print(f"activated: {previous} -> {args.name}")
             else:
