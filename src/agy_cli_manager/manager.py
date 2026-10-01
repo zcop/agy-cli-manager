@@ -538,6 +538,28 @@ def _remove_managed_profile_files(target: Path) -> None:
         (target / name).unlink(missing_ok=True)
 
 
+def _ensure_keychain_access(home_root: Path) -> None:
+    """Keep the macOS login keychain reachable from a spoofed HOME.
+
+    agy talks to the login keychain through the `security` CLI, which
+    resolves keychains relative to $HOME. Manager-spawned agy runs use
+    isolated profile homes, so link the real keychain directory into them.
+    """
+    if sys.platform != "darwin":
+        return
+    real_keychains = Path.home() / "Library" / "Keychains"
+    if not real_keychains.is_dir():
+        return
+    link = home_root / "Library" / "Keychains"
+    if link.is_symlink() or link.exists():
+        return
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real_keychains)
+    except OSError:
+        pass
+
+
 def _copy_account_profile(source_dir: Path, target_home: Path) -> None:
     profile_source = _resolve_profile_source(source_dir)
     target_profile = target_home / ".gemini"
@@ -810,6 +832,7 @@ def _google_userinfo_request(access_token: str) -> dict:
 
 def _run_agy_warmup(home_root: Path, agy_binary: str | None, timeout_seconds: int) -> None:
     resolved_binary = resolve_agy_binary(agy_binary)
+    _ensure_keychain_access(home_root)
     env = os.environ.copy()
     env["HOME"] = str(home_root)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
@@ -932,6 +955,7 @@ def _run_agy_models_command(
     timeout_seconds: int = 30,
 ) -> list[dict]:
     resolved_binary = resolve_agy_binary(agy_binary)
+    _ensure_keychain_access(runtime_home)
     env = os.environ.copy()
     env["HOME"] = str(runtime_home)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
@@ -1992,6 +2016,7 @@ def probe_profile_identity_via_usage(
     # Each saved account is already a complete home. Probing it directly keeps
     # the shared live home and the manager runtime untouched during switches.
     del live_dir
+    _ensure_keychain_access(source_home)
     env = os.environ.copy()
     env["HOME"] = str(source_home)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
@@ -2942,6 +2967,7 @@ def login_account(
         runtime_home = Path(home_string)
         login_dir = runtime_home / ".gemini"
         login_dir.mkdir()
+        _ensure_keychain_access(runtime_home)
 
         env = os.environ.copy()
         env["HOME"] = str(runtime_home)

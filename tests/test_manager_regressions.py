@@ -21,7 +21,9 @@ class ManagerRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="agy-manager-test-")
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        # Production code resolves account paths; on macOS tempfile lives
+        # under /var, a symlink to /private/var, so resolve to match.
+        self.base = Path(self.tmp.name).resolve()
         self.live_home = self.base / "live"
         self.paths = m.build_paths(self.base / "manager")
         live_patch = mock.patch.object(m, "default_live_dir", return_value=self.live_home / ".gemini")
@@ -187,6 +189,50 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertEqual(m.load_state(self.paths)["active"], "a")
         self.assertEqual(self.token(self.live_home).read_text(encoding="utf-8"), "token-a")
         self.assertEqual(self.token(m.account_dir(self.paths, "b")).read_text(encoding="utf-8"), "token-b")
+
+    def test_macos_keychain_is_linked_into_spawned_agy_homes(self) -> None:
+        self.add("a")
+        real_keychains = self.base / "Library" / "Keychains"
+        real_keychains.mkdir(parents=True)
+        account_home = m.account_dir(self.paths, "a")
+        with mock.patch.object(m.sys, "platform", "darwin"), \
+             mock.patch.object(m.Path, "home", return_value=self.base), \
+             mock.patch.object(m, "resolve_agy_binary", return_value="agy"), \
+             mock.patch.object(
+                 m.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess(["agy"], 0, "Gemini 3 Pro", ""),
+             ):
+            models = m._run_agy_models_command(account_home)
+        self.assertEqual(models[0]["name"], "Gemini 3 Pro")
+        link = account_home / "Library" / "Keychains"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), real_keychains.resolve())
+
+    def test_login_home_links_macos_keychain(self) -> None:
+        self.add("a")
+        real_keychains = self.base / "Library" / "Keychains"
+        real_keychains.mkdir(parents=True)
+        observed: dict = {}
+
+        def fake_login(*args, **kwargs):
+            home = Path(kwargs["env"]["HOME"])
+            link = home / "Library" / "Keychains"
+            observed["linked"] = link.is_symlink() and link.resolve() == real_keychains.resolve()
+            token = self.token(home)
+            token.parent.mkdir(parents=True)
+            token.write_text("token-b", encoding="utf-8")
+            return mock.Mock(poll=mock.Mock(return_value=0))
+
+        with mock.patch.object(m.sys, "platform", "darwin"), \
+             mock.patch.object(m.Path, "home", return_value=self.base), \
+             mock.patch.object(m.os, "isatty", return_value=True), \
+             mock.patch.object(m, "resolve_agy_binary", return_value="/fake/agy"), \
+             mock.patch.object(m.subprocess, "Popen", side_effect=fake_login), \
+             mock.patch.object(m, "resolve_login_profile_identity", return_value={}), \
+             redirect_stdout(io.StringIO()):
+            m.login_account(self.paths, "b", None)
+        self.assertTrue(observed["linked"])
 
     def test_quota_summary_preserves_gemini_and_other_families(self) -> None:
         summary = {
