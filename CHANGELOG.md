@@ -11,6 +11,10 @@
 - expose persisted model-family usage in status snapshots used by the TUI and JSON API
 - add `resolve-route` for configurable account-first, family-first, or strict-family routing decisions
 
+### Fixes
+
+- keep the macOS login keychain reachable when agy runs in manager-controlled homes, fixing "keychain could not be found" errors during login, warmup, and identity probes
+
 ## v0.2.2 - 2026-09-21
 
 - add `agy-cli-manager watch` to tail Antigravity CLI logs and fail over on `Individual quota reached`
