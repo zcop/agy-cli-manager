@@ -242,6 +242,10 @@ def _append_log(path: Path, line: str) -> None:
 
 
 def _make_watch_harness(tmp: Path, names: tuple[str, ...] = ("account-a", "account-b", "account-c")):
+    # set_live_dir() persists the resolved live dir, so pollers key cursors
+    # and events by resolved paths; on macOS tempfile lives under the /var ->
+    # /private/var symlink. Resolve up front so returned paths match.
+    tmp = tmp.resolve()
     root = tmp / "manager"
     live_dir = tmp / "live" / ".gemini"
     log_dir = live_dir / "antigravity-cli" / "log"
@@ -409,15 +413,16 @@ class LogWatchIntegrationTests(unittest.TestCase):
 
     def test_empty_init_then_first_quota_log_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "manager"
-            live_dir = Path(tmp) / "live" / ".gemini"
+            base = Path(tmp).resolve()
+            root = base / "manager"
+            live_dir = base / "live" / ".gemini"
             log_dir = live_dir / "antigravity-cli" / "log"
             log_dir.mkdir(parents=True)
             paths = build_paths(root)
             ensure_layout(paths)
             set_live_dir(paths, live_dir)
-            add_account(paths, "account-a", _write_token_home(Path(tmp), "account-a"))
-            add_account(paths, "account-b", _write_token_home(Path(tmp), "account-b"))
+            add_account(paths, "account-a", _write_token_home(base, "account-a"))
+            add_account(paths, "account-b", _write_token_home(base, "account-b"))
             set_switch_mode(paths, "auto")
 
             first = poll_quota_logs(paths, rotate=True)

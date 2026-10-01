@@ -21,7 +21,9 @@ class ManagerRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="agy-manager-test-")
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        # Production code resolves account paths; on macOS tempfile lives
+        # under /var, a symlink to /private/var, so resolve to match.
+        self.base = Path(self.tmp.name).resolve()
         self.live_home = self.base / "live"
         self.paths = m.build_paths(self.base / "manager")
         live_patch = mock.patch.object(m, "default_live_dir", return_value=self.live_home / ".gemini")
