@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.3 - 2026-10-03
 
 - parse and persist separate Gemini and Claude/GPT-OSS quota families
 - show five-hour and weekly quota for both model families in the TUI
