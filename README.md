@@ -159,6 +159,7 @@ Leave the dashboard open instead of `watch` if you prefer (`Y` acknowledges the 
 
 ```bash
 agy-cli-manager status --json
+agy-cli-manager credential-status --json
 agy-cli-manager whoami
 agy-cli-manager models --json
 agy-cli-manager ensure-active --json
@@ -179,6 +180,32 @@ agy-cli-manager watch
 agy-cli-manager watch --once --json
 agy-cli-manager ack-restart
 ```
+
+### Linux Secret Service
+
+Recent `agy` versions may use the Linux Secret Service item identified by
+`service=gemini` and `username=antigravity` instead of, or ahead of, the token
+file. Install your distribution's `secret-tool` package (for Debian/Ubuntu,
+`libsecret-tools`) when using a desktop keyring:
+
+```bash
+agy-cli-manager credential-status --json
+agy-cli-manager credential-backend auto
+agy-cli-manager import-current account1 ~/.gemini
+agy-cli-manager capture-active --json
+```
+
+`auto` selects Secret Service only when the helper, D-Bus session, and exact
+Antigravity credential are present; SSH/server installations with no keyring
+entry keep the file backend. Use `credential-backend secret-service` to require
+the keyring or `credential-backend file` to opt out explicitly.
+
+Saved accounts remain private `0600` JSON files. Switching writes and verifies
+the live keyring credential before publishing the new active account, and rolls
+back the keyring, live file, and runtime token on failure. Close a running `agy`
+before switching or capturing because it keeps the old credential in memory.
+Named model, usage, and warmup probes isolate D-Bus so the global keyring cannot
+silently override the selected saved profile.
 
 The current switch policy is stored in manager state and can be controlled by either:
 
@@ -391,6 +418,9 @@ Public Python API:
 - `build_paths(root)`
 - `ensure_layout(paths)`
 - `get_status_snapshot(paths)`
+- `get_credential_status(paths)`
+- `set_credential_backend(paths, backend)`
+- `capture_active_credential(paths)`
 - `get_switch_policy(paths)`
 - `update_switch_policy(paths, ...)`
 - `ensure_active_account(paths, force=False, required_family=None)`

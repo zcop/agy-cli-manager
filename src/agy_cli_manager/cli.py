@@ -16,12 +16,14 @@ from agy_cli_manager.manager import (
     apply_active,
     build_paths,
     clear_bad,
+    capture_active_credential,
     default_root,
     ensure_active_account,
     ensure_layout,
     format_status,
     get_account_identity,
     get_account_proxy,
+    get_credential_status,
     get_live_dir,
     pick_due_refresh_account,
     get_status_snapshot,
@@ -41,6 +43,7 @@ from agy_cli_manager.manager import (
     set_live_dir,
     set_account_proxy,
     set_enabled,
+    set_credential_backend,
     set_switch_mode,
     switch_account,
     switch_next,
@@ -93,6 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
     proxy_clear.add_argument("name")
     proxy_clear.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     sub.add_parser("apply-active", help="Re-apply the current active account to runtime and live_dir")
+    credential_status = sub.add_parser("credential-status", help="Show the configured and effective credential backend")
+    credential_status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    credential_backend = sub.add_parser("credential-backend", help="Show or set the credential backend")
+    credential_backend.add_argument("backend", nargs="?", choices=("auto", "file", "secret-service"))
+    credential_backend.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    capture_credential = sub.add_parser("capture-active", help="Capture the live credential into the active saved profile")
+    capture_credential.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     ensure_cmd = sub.add_parser("ensure-active", help="Evaluate switch policy and ensure there is a usable active account")
     ensure_cmd.add_argument("--force", action="store_true", help="Apply the policy even when switch mode is manual")
     ensure_cmd.add_argument("--family", choices=("gemini", "other"), help="Require usable quota for this model family")
@@ -1987,6 +1997,19 @@ def main() -> int:
         if args.command == "apply-active":
             active = apply_active(paths)
             print(f"applied-active: {active}")
+            return 0
+        if args.command == "credential-status":
+            payload = get_credential_status(paths)
+            print(json.dumps(payload, indent=2, sort_keys=True) if args.json else f"{payload['configured']} -> {payload['effective']}")
+            return 0
+        if args.command == "credential-backend":
+            payload = get_credential_status(paths) if args.backend is None else set_credential_backend(paths, args.backend)
+            print(json.dumps(payload, indent=2, sort_keys=True) if args.json else f"{payload['configured']} -> {payload['effective']}")
+            return 0
+        if args.command == "capture-active":
+            active = capture_active_credential(paths)
+            payload = {"account": active, "captured": True}
+            print(json.dumps(payload, indent=2, sort_keys=True) if args.json else f"captured-active: {active}")
             return 0
         if args.command == "ensure-active":
             result = ensure_active_account(paths, force=args.force, required_family=args.family)

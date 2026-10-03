@@ -10,6 +10,10 @@
 - keep quota cooldowns scoped to the depleted family instead of disabling the whole account
 - expose persisted model-family usage in status snapshots used by the TUI and JSON API
 - add `resolve-route` for configurable account-first, family-first, or strict-family routing decisions
+- add optional Linux Secret Service support for keyring-only `agy` credentials
+- add atomic keyring/file/runtime activation with rollback before active state is published
+- add `credential-status`, `credential-backend`, and `capture-active` commands
+- isolate named `agy` probes from the global Linux keyring
 
 ## v0.2.2 - 2026-09-21
 

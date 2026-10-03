@@ -39,6 +39,8 @@ USAGE_WINDOW_NAMES = ("short", "weekly")
 USAGE_FAMILY_NAMES = ("gemini", "other")
 DEFAULT_SWITCH_MODE = "auto"
 VALID_SWITCH_MODES = ("auto", "manual")
+DEFAULT_CREDENTIAL_BACKEND = "auto"
+VALID_CREDENTIAL_BACKENDS = ("auto", "file", "secret-service")
 DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD = 2
 DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT = 10.0
 DEFAULT_GEMINI_SWITCH_THRESHOLD_PERCENT = DEFAULT_SHORT_SWITCH_THRESHOLD_PERCENT
@@ -176,6 +178,7 @@ def ensure_layout(paths: ManagerPaths) -> None:
                 "active": None,
                 "accounts": {},
                 "live_dir": str(default_live_dir()),
+                "credential_backend": DEFAULT_CREDENTIAL_BACKEND,
                 "switch_mode": DEFAULT_SWITCH_MODE,
                 "switch_policy": _default_switch_policy(),
                 "switch_runtime": _default_switch_runtime(),
@@ -229,6 +232,7 @@ def load_state(paths: ManagerPaths) -> dict:
     data.setdefault("active", None)
     data.setdefault("accounts", {})
     data.setdefault("live_dir", str(default_live_dir()))
+    data["credential_backend"] = _normalize_credential_backend(data.get("credential_backend"))
     data["switch_mode"] = _normalize_switch_mode(data.get("switch_mode"))
     data["switch_policy"] = _normalize_switch_policy(data.get("switch_policy"))
     data["switch_runtime"] = _normalize_switch_runtime(data.get("switch_runtime"))
@@ -256,6 +260,14 @@ def _normalize_switch_mode(value: object) -> str:
         if normalized in VALID_SWITCH_MODES:
             return normalized
     return DEFAULT_SWITCH_MODE
+
+
+def _normalize_credential_backend(value: object) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_CREDENTIAL_BACKENDS:
+            return normalized
+    return DEFAULT_CREDENTIAL_BACKEND
 
 
 def get_switch_mode(state: dict) -> str:
@@ -544,6 +556,121 @@ def _copy_account_profile(source_dir: Path, target_home: Path) -> None:
     _copy_managed_profile_files(profile_source, target_profile)
 
 
+def _write_private_credential(path: Path, blob: bytes, *, validate: bool = True) -> None:
+    payload = bytes(blob)
+    if validate:
+        from agy_cli_manager.credential_store import validate_antigravity_credential
+
+        payload = validate_antigravity_credential(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".credential-", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _configured_credential_backend(state: dict) -> str:
+    return _normalize_credential_backend(state.get("credential_backend"))
+
+
+def _effective_credential_backend(state: dict) -> str:
+    configured = _configured_credential_backend(state)
+    if configured == "file":
+        return "file"
+    from agy_cli_manager.credential_store import (
+        linux_secret_service_available,
+        read_linux_live_credential,
+    )
+
+    available = linux_secret_service_available()
+    if configured == "secret-service" and not available:
+        from agy_cli_manager.credential_store import CredentialStoreError
+
+        raise CredentialStoreError(
+            "The secret-service credential backend is configured but unavailable. "
+            "Ensure a D-Bus session exists and install `secret-tool`."
+        )
+    if configured == "secret-service":
+        return "secret-service"
+    if not available:
+        return "file"
+    try:
+        return "secret-service" if read_linux_live_credential(required=False) is not None else "file"
+    except ValueError:
+        return "file"
+
+
+def _capture_linux_live_credential(profile_dir: Path, state: dict) -> bool:
+    if _effective_credential_backend(state) != "secret-service":
+        return False
+    from agy_cli_manager.credential_store import read_linux_live_credential
+
+    blob = read_linux_live_credential(required=True)
+    _write_private_credential(profile_dir / MANAGED_PROFILE_FILES[0], blob)
+    return True
+
+
+def _snapshot_file(path: Path) -> tuple[bool, bytes | None]:
+    return (path.is_file(), path.read_bytes() if path.is_file() else None)
+
+
+def _restore_file(path: Path, snapshot: tuple[bool, bytes | None]) -> None:
+    existed, content = snapshot
+    if existed and content is not None:
+        _write_private_credential(path, content, validate=False)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _agy_processes_running() -> list[str]:
+    if not sys.platform.startswith("linux"):
+        return []
+    running: list[str] = []
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            name = (entry / "comm").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if name.lower() in {"agy", "agy.exe"}:
+            running.append(f"{name} pid={entry.name}")
+    return running
+
+
+@contextmanager
+def _isolated_linux_login_credential(state: dict, login_profile: Path):
+    if _effective_credential_backend(state) != "secret-service":
+        yield
+        return
+    if _agy_processes_running():
+        raise ValueError("Refusing to start an isolated login while another agy process is running.")
+    from agy_cli_manager.credential_store import (
+        clear_linux_live_credential,
+        read_linux_live_credential,
+        restore_linux_live_credential,
+    )
+
+    original = read_linux_live_credential(required=False)
+    if original is not None:
+        clear_linux_live_credential()
+    try:
+        yield
+        captured = read_linux_live_credential(required=True)
+        _write_private_credential(login_profile / MANAGED_PROFILE_FILES[0], captured)
+    finally:
+        restore_linux_live_credential(original)
+
+
 def _resolve_profile_source(source_dir: Path) -> Path:
     source_dir = source_dir.resolve()
     gemini_dir = source_dir / ".gemini"
@@ -813,6 +940,8 @@ def _run_agy_warmup(home_root: Path, agy_binary: str | None, timeout_seconds: in
     env = os.environ.copy()
     env["HOME"] = str(home_root)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    if sys.platform.startswith("linux"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/agy-cli-manager-isolated-no-keyring"
     proc = subprocess.run(
         [
             resolved_binary,
@@ -935,6 +1064,8 @@ def _run_agy_models_command(
     env = os.environ.copy()
     env["HOME"] = str(runtime_home)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    if sys.platform.startswith("linux"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/agy-cli-manager-isolated-no-keyring"
     proc = subprocess.run(
         [resolved_binary, "models"],
         cwd=runtime_home,
@@ -1302,10 +1433,7 @@ def resolve_route(
         if get_switch_mode(state) != "auto" and not force_switch:
             return RouteResult(family, selected_family, previous, previous, None, strategy, "switch_required", selected_account)
 
-        _copy_active_runtime(paths, selected_account)
-        state["active"] = selected_account
-        state = sync_state_from_disk(paths, state)
-        _sync_runtime_to_live_dir(paths, state)
+        state = _activate_account_locked(paths, state, selected_account)
         save_state(paths, state)
         outcome = "account_switch" if selected_family == family else "account_and_family_fallback"
         return RouteResult(family, selected_family, previous, selected_account, selected_account, strategy, outcome)
@@ -1359,10 +1487,7 @@ def ensure_active_account(
             state = sync_state_from_disk(paths, load_state(paths))
             switched_to = _best_switch_candidate(paths, state, required_family=family)
             if switched_to:
-                _copy_active_runtime(paths, switched_to)
-                state["active"] = switched_to
-                state = sync_state_from_disk(paths, state)
-                _sync_runtime_to_live_dir(paths, state)
+                state = _activate_account_locked(paths, state, switched_to)
                 save_state(paths, state)
         if not switched_to:
             return EnsureActiveResult(
@@ -1392,10 +1517,7 @@ def ensure_active_account(
             state = sync_state_from_disk(paths, load_state(paths))
             switched_to = _best_switch_candidate(paths, state, exclude=active_name, required_family=family)
             if switched_to:
-                _copy_active_runtime(paths, switched_to)
-                state["active"] = switched_to
-                state = sync_state_from_disk(paths, state)
-                _sync_runtime_to_live_dir(paths, state)
+                state = _activate_account_locked(paths, state, switched_to)
                 save_state(paths, state)
         if not switched_to:
             return EnsureActiveResult(
@@ -1995,6 +2117,8 @@ def probe_profile_identity_via_usage(
     env = os.environ.copy()
     env["HOME"] = str(source_home)
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    if sys.platform.startswith("linux"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/agy-cli-manager-isolated-no-keyring"
 
     proc = subprocess.run(
         [resolved_binary, "-p", "/usage"],
@@ -2285,15 +2409,17 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
         }
         _sync_legacy_usage_fields(state["accounts"][name])
         if overwrite and state.get("active") == name:
-            _copy_active_runtime(paths, name)
-            state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
-        save_state(paths, state)
+            state = _activate_account_locked(paths, state, name)
         if not state.get("active"):
-            _copy_active_runtime(paths, name)
-            state["active"] = name
-            state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
+            try:
+                state = _activate_account_locked(paths, state, name)
+            except BaseException:
+                state["accounts"].pop(name, None)
+                if not target_exists:
+                    shutil.rmtree(target, ignore_errors=True)
+                raise
+            save_state(paths, state)
+        else:
             save_state(paths, state)
 
 
@@ -2307,6 +2433,11 @@ def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = Non
         live_dir = source_dir or get_live_dir(state)
         if live_dir is None:
             raise ValueError("No source_dir provided and no live_dir configured.")
+        profile_source = _resolve_profile_source(live_dir)
+        configured_live = get_live_dir(state)
+        is_live_source = configured_live is not None and profile_source.resolve() == configured_live.resolve()
+        if not profile_has_login_artifacts(profile_source) and is_live_source:
+            _capture_linux_live_credential(profile_source, state)
     add_account(paths, name, live_dir)
 
 
@@ -2328,6 +2459,63 @@ def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
     _copy_account_profile(paths.runtime_dir, live_dir.parent)
 
 
+def _activate_account_locked(paths: ManagerPaths, state: dict, name: str) -> dict:
+    source_home = account_dir(paths, name)
+    source_profile = _resolve_profile_source(source_home)
+    if not source_home.exists() or not profile_has_login_artifacts(source_profile):
+        raise ValueError(f"Account {name} is missing required auth files")
+
+    live_dir = get_live_dir(state)
+    backend = _effective_credential_backend(state)
+    if backend == "secret-service" and _agy_processes_running():
+        raise ValueError(
+            "Refusing to switch the Linux Secret Service credential while agy is running. "
+            "Exit agy and retry; the next chatbox worker will coordinate this automatically."
+        )
+
+    source_token = source_profile / MANAGED_PROFILE_FILES[0]
+    live_token = live_dir / MANAGED_PROFILE_FILES[0] if live_dir is not None else None
+    runtime_token = paths.runtime_dir / ".gemini" / MANAGED_PROFILE_FILES[0]
+    live_snapshot = _snapshot_file(live_token) if live_token is not None else None
+    runtime_snapshot = _snapshot_file(runtime_token)
+    secret_snapshot = None
+
+    if backend == "secret-service" and live_dir is not None:
+        from agy_cli_manager.credential_store import (
+            read_linux_live_credential,
+            validate_antigravity_credential,
+        )
+
+        source_blob = validate_antigravity_credential(source_token.read_bytes())
+        secret_snapshot = read_linux_live_credential(required=False)
+    else:
+        source_blob = None
+
+    try:
+        if source_blob is not None:
+            from agy_cli_manager.credential_store import write_linux_live_credential
+
+            write_linux_live_credential(source_blob)
+        if live_dir is not None:
+            _copy_account_profile(source_home, live_dir.parent)
+        _copy_account_profile(source_home, paths.runtime_dir)
+    except BaseException:
+        if backend == "secret-service" and live_dir is not None:
+            from agy_cli_manager.credential_store import restore_linux_live_credential
+
+            try:
+                restore_linux_live_credential(secret_snapshot)
+            except BaseException:
+                pass
+        if live_token is not None and live_snapshot is not None:
+            _restore_file(live_token, live_snapshot)
+        _restore_file(runtime_token, runtime_snapshot)
+        raise
+
+    state["active"] = name
+    return sync_state_from_disk(paths, state)
+
+
 def switch_account(paths: ManagerPaths, name: str) -> str:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
@@ -2341,10 +2529,7 @@ def switch_account(paths: ManagerPaths, name: str) -> str:
             raise ValueError(f"Account is in cooldown until {cooldown_until.isoformat()}: {name}")
 
         previous = state.get("active")
-        _copy_active_runtime(paths, name)
-        state["active"] = name
-        state = sync_state_from_disk(paths, state)
-        _sync_runtime_to_live_dir(paths, state)
+        state = _activate_account_locked(paths, state, name)
         save_state(paths, state)
         return previous or ""
 
@@ -2364,10 +2549,7 @@ def switch_next(paths: ManagerPaths) -> str:
             raise ValueError("No eligible standby account is available.")
         if len(candidates) == 1 and current == target:
             raise ValueError("Only one eligible account is available.")
-        _copy_active_runtime(paths, target)
-        state["active"] = target
-        state = sync_state_from_disk(paths, state)
-        _sync_runtime_to_live_dir(paths, state)
+        state = _activate_account_locked(paths, state, target)
         save_state(paths, state)
         return target
 
@@ -2409,6 +2591,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "runtime_dir": str(paths.runtime_dir),
         "lock_file": str(paths.lock_file),
         "live_dir": state.get("live_dir"),
+        "credential_backend": _configured_credential_backend(state),
         "active": active_name,
         "active_proxy": _normalize_proxy_config(active_meta.get("proxy")) if isinstance(active_meta, dict) else _default_proxy_config(),
         "switch_mode": get_switch_mode(state),
@@ -2423,6 +2606,53 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
 def get_switch_policy(paths: ManagerPaths) -> dict:
     state = sync_state_from_disk(paths, load_state(paths))
     return dict(_state_switch_policy(state))
+
+
+def get_credential_status(paths: ManagerPaths) -> dict:
+    state = sync_state_from_disk(paths, load_state(paths))
+    configured = _configured_credential_backend(state)
+    from agy_cli_manager.credential_store import linux_secret_service_available
+
+    available = linux_secret_service_available()
+    effective = "file"
+    error = None
+    try:
+        effective = _effective_credential_backend(state)
+    except ValueError as exc:
+        error = str(exc)
+    return {
+        "configured": configured,
+        "effective": effective,
+        "secret_service_available": available,
+        "error": error,
+    }
+
+
+def set_credential_backend(paths: ManagerPaths, backend: str) -> dict:
+    normalized = _normalize_credential_backend(backend)
+    if normalized != backend.strip().lower():
+        raise ValueError(f"Unsupported credential backend: {backend}")
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        state["credential_backend"] = normalized
+        save_state(paths, state)
+    return get_credential_status(paths)
+
+
+def capture_active_credential(paths: ManagerPaths) -> str:
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        active = state.get("active")
+        if not active:
+            raise ValueError("No active account is set.")
+        if _effective_credential_backend(state) != "secret-service":
+            raise ValueError("The effective credential backend is not secret-service.")
+        if _agy_processes_running():
+            raise ValueError("Refusing to capture credentials while agy is running.")
+        target_profile = _resolve_profile_source(account_dir(paths, active))
+        _capture_linux_live_credential(target_profile, state)
+        _copy_account_profile(account_dir(paths, active), paths.runtime_dir)
+        return active
 
 
 def get_account_proxy(paths: ManagerPaths, name: str | None = None) -> tuple[str, dict]:
@@ -2672,8 +2902,7 @@ def apply_active(paths: ManagerPaths) -> str:
         active = state.get("active")
         if not active:
             raise ValueError("No active account is set.")
-        _copy_active_runtime(paths, active)
-        _sync_runtime_to_live_dir(paths, state)
+        state = _activate_account_locked(paths, state, active)
         save_state(paths, state)
         return active
 
@@ -2885,10 +3114,7 @@ def rotate_after_failure_locked(
     if force_switch or switch_mode == "auto":
         switched_to = _best_switch_candidate(paths, state, exclude=previous, required_family=family)
         if switched_to:
-            _copy_active_runtime(paths, switched_to)
-            state["active"] = switched_to
-            state = sync_state_from_disk(paths, state)
-            _sync_runtime_to_live_dir(paths, state)
+            state = _activate_account_locked(paths, state, switched_to)
 
     _mark_switch_runtime(
         state,
@@ -2925,6 +3151,49 @@ def rotate_after_failure_locked(
     )
 
 
+def _run_interactive_agy_login(runtime_home: Path, resolved_binary: str, timeout_seconds: int) -> None:
+    env = os.environ.copy()
+    env["HOME"] = str(runtime_home)
+    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    try:
+        proc = subprocess.Popen(
+            [resolved_binary],
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            cwd=runtime_home,
+            env=env,
+            close_fds=True,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(f"agy binary not found: {resolved_binary}") from exc
+
+    start_time = time.time()
+    print("Launching real agy login session.")
+    print("Complete onboarding/login there, then exit agy to save the profile.")
+    sys.stdout.flush()
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            if time.time() - start_time > timeout_seconds:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        raise
+
+
 def login_account(
     paths: ManagerPaths,
     name: str,
@@ -2938,51 +3207,15 @@ def login_account(
 
     resolved_binary = resolve_agy_binary(agy_binary)
     ensure_layout(paths)
+    with manager_lock(paths):
+        login_state = sync_state_from_disk(paths, load_state(paths))
     with tempfile.TemporaryDirectory(prefix="login-", dir=paths.root) as home_string:
         runtime_home = Path(home_string)
         login_dir = runtime_home / ".gemini"
         login_dir.mkdir()
 
-        env = os.environ.copy()
-        env["HOME"] = str(runtime_home)
-        env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
-        try:
-            proc = subprocess.Popen(
-                [resolved_binary],
-                stdin=sys.stdin,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-                cwd=runtime_home,
-                env=env,
-                close_fds=True,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(f"agy binary not found: {resolved_binary}") from exc
-
-        start_time = time.time()
-        print("Launching real agy login session.")
-        print("Complete onboarding/login there, then exit agy to save the profile.")
-        sys.stdout.flush()
-        try:
-            while True:
-                if proc.poll() is not None:
-                    break
-                if time.time() - start_time > timeout_seconds:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    raise ValueError(f"Login timed out after {timeout_seconds} seconds.")
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            raise
+        with _isolated_linux_login_credential(login_state, login_dir):
+            _run_interactive_agy_login(runtime_home, resolved_binary, timeout_seconds)
 
         if not profile_has_login_artifacts(login_dir):
             raise ValueError("agy login did not produce a usable auth profile.")

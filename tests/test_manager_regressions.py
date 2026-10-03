@@ -14,6 +14,10 @@ from unittest import mock
 from agy_cli_manager import manager as m
 
 
+def json_token(label: str) -> str:
+    return json.dumps({"token": {"access_token": f"access-{label}", "refresh_token": f"refresh-{label}"}})
+
+
 TOKEN_PATH = Path(".gemini/antigravity-cli/antigravity-oauth-token")
 
 
@@ -127,6 +131,11 @@ class ManagerRegressionTests(unittest.TestCase):
 
         def run_probe(*args, **kwargs):
             self.assertEqual(kwargs["env"]["HOME"], str(m.account_dir(self.paths, "b")))
+            if m.sys.platform.startswith("linux"):
+                self.assertEqual(
+                    kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"],
+                    "unix:path=/tmp/agy-cli-manager-isolated-no-keyring",
+                )
             m.switch_account(self.paths, "b")
             return subprocess.CompletedProcess(args[0], 0, "b@example.com", "")
 
@@ -358,3 +367,68 @@ class ManagerRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "gemini_quota_exhausted")
         self.assertEqual(result.switched_to, "b")
+
+    def test_keyring_only_live_profile_can_be_imported(self) -> None:
+        payload = json_token("keyring").encode()
+        with mock.patch.object(m, "_effective_credential_backend", return_value="secret-service"), \
+             mock.patch("agy_cli_manager.credential_store.read_linux_live_credential", return_value=payload), \
+             mock.patch("agy_cli_manager.credential_store.write_linux_live_credential"), \
+             mock.patch.object(m, "_agy_processes_running", return_value=[]):
+            m.import_current(self.paths, "keyring-only", self.live_home / ".gemini")
+
+        saved = self.token(m.account_dir(self.paths, "keyring-only"))
+        self.assertEqual(saved.read_bytes(), payload)
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_secret_service_switch_rolls_back_files_and_state(self) -> None:
+        self.add("a")
+        self.add("b")
+        for name in ("a", "b"):
+            self.token(m.account_dir(self.paths, name)).write_text(json_token(name), encoding="utf-8")
+        m.switch_account(self.paths, "a")
+        before_live = self.token(self.live_home).read_bytes()
+        before_runtime = self.token(self.paths.runtime_dir).read_bytes()
+
+        with mock.patch.object(m, "_effective_credential_backend", return_value="secret-service"), \
+             mock.patch("agy_cli_manager.credential_store.read_linux_live_credential", return_value=json_token("a").encode()), \
+             mock.patch("agy_cli_manager.credential_store.write_linux_live_credential", side_effect=ValueError("simulated store failure")), \
+             mock.patch("agy_cli_manager.credential_store.restore_linux_live_credential"), \
+             mock.patch.object(m, "_agy_processes_running", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "simulated store failure"):
+                m.switch_account(self.paths, "b")
+
+        self.assertEqual(m.load_state(self.paths)["active"], "a")
+        self.assertEqual(self.token(self.live_home).read_bytes(), before_live)
+        self.assertEqual(self.token(self.paths.runtime_dir).read_bytes(), before_runtime)
+
+    def test_isolated_keyring_login_captures_new_and_restores_original(self) -> None:
+        original = json_token("original").encode()
+        captured = json_token("captured").encode()
+        login_profile = self.base / "login-home" / ".gemini"
+        login_profile.mkdir(parents=True)
+        with mock.patch.object(m, "_effective_credential_backend", return_value="secret-service"), \
+             mock.patch.object(m, "_agy_processes_running", return_value=[]), \
+             mock.patch("agy_cli_manager.credential_store.read_linux_live_credential", side_effect=[original, captured]), \
+             mock.patch("agy_cli_manager.credential_store.clear_linux_live_credential") as clear, \
+             mock.patch("agy_cli_manager.credential_store.restore_linux_live_credential") as restore:
+            with m._isolated_linux_login_credential({}, login_profile):
+                pass
+
+        self.assertEqual((login_profile / m.MANAGED_PROFILE_FILES[0]).read_bytes(), captured)
+        clear.assert_called_once_with()
+        restore.assert_called_once_with(original)
+
+    def test_initial_keyring_activation_failure_does_not_publish_account(self) -> None:
+        source = self.base / "source-initial"
+        self.token(source).parent.mkdir(parents=True)
+        self.token(source).write_text(json_token("initial"), encoding="utf-8")
+        with mock.patch.object(m, "_effective_credential_backend", return_value="secret-service"), \
+             mock.patch("agy_cli_manager.credential_store.read_linux_live_credential", return_value=None), \
+             mock.patch("agy_cli_manager.credential_store.write_linux_live_credential", side_effect=ValueError("simulated store failure")), \
+             mock.patch("agy_cli_manager.credential_store.restore_linux_live_credential"), \
+             mock.patch.object(m, "_agy_processes_running", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "simulated store failure"):
+                m.add_account(self.paths, "initial", source)
+
+        self.assertNotIn("initial", m.load_state(self.paths)["accounts"])
+        self.assertFalse(m.account_dir(self.paths, "initial").exists())
