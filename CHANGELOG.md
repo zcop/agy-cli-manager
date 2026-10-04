@@ -15,6 +15,10 @@
 - add `credential-status`, `credential-backend`, and `capture-active` commands
 - isolate named `agy` probes from the global Linux keyring
 
+### Fixes
+
+- keep the macOS login keychain reachable when agy runs in manager-controlled homes, fixing "keychain could not be found" errors during login, warmup, and identity probes
+
 ## v0.2.2 - 2026-09-21
 
 - add `agy-cli-manager watch` to tail Antigravity CLI logs and fail over on `Individual quota reached`
