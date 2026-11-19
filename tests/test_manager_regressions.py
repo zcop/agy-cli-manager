@@ -224,6 +224,82 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertEqual(families["other"]["short"]["value"], 75.0)
         self.assertEqual(families["other"]["weekly"]["value"], 100.0)
 
+    def test_quota_requests_use_daily_cloud_code_backend(self) -> None:
+        # The prod host reports every bucket as full; agy itself uses daily.
+        self.assertEqual(m.CODE_ASSIST_BASE_URL, "https://daily-cloudcode-pa.googleapis.com")
+
+    def test_refresh_reads_gemini_quota_from_model_buckets(self) -> None:
+        self.add("a")
+        self.token(m.account_dir(self.paths, "a")).write_text(json_token("a"), encoding="utf-8")
+        summary = {
+            "groups": [
+                {
+                    "displayName": "Claude and GPT models",
+                    "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                    "buckets": [
+                        {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.3069284, "resetTime": "2026-11-26T17:58:43Z"},
+                        {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0, "resetTime": "2026-11-19T22:58:43Z"},
+                    ],
+                }
+            ]
+        }
+        model_quota = {
+            "buckets": [
+                {"tokenType": "WTUS", "modelId": "chat_20706", "remainingFraction": 1},
+                {"tokenType": "WTUS", "modelId": "claude-opus-5-5-high", "remainingFraction": 0, "resetTime": "2026-11-19T22:58:43Z"},
+                {"tokenType": "WTUS", "modelId": "gemini-2.5-pro", "remainingFraction": 0.0062278667, "resetTime": "2026-11-19T21:01:05Z"},
+                {"tokenType": "WTUS", "modelId": "gemini-3-flash", "remainingFraction": 0.0062278667, "resetTime": "2026-11-19T21:01:05Z"},
+                {"tokenType": "WTUS", "modelId": "tab_flash_lite_preview", "remainingFraction": 1},
+            ]
+        }
+
+        def fake_cloudcode(token, endpoint, body):
+            if endpoint == m.CODE_ASSIST_LOAD_PATH:
+                return {"cloudaicompanionProject": "project-a"}
+            if endpoint == m.CODE_ASSIST_QUOTA_SUMMARY_PATH:
+                return summary
+            if endpoint == m.CODE_ASSIST_QUOTA_PATH:
+                return model_quota
+            raise AssertionError(endpoint)
+
+        with mock.patch.object(m, "_cloudcode_request", side_effect=fake_cloudcode), \
+             mock.patch.object(m, "_best_effort_live_identity", return_value=None), \
+             mock.patch.object(m, "ensure_active_account"):
+            result = m.refresh_account_usage(self.paths, "a")
+
+        gemini = result.usage_families["gemini"]
+        other = result.usage_families["other"]
+        self.assertEqual(gemini["short"]["status"], "known")
+        self.assertEqual(gemini["short"]["value"], 0.62)
+        self.assertEqual(gemini["short"]["reset_at"], "2026-11-19T21:01:05+00:00")
+        self.assertEqual(gemini["weekly"]["status"], "unknown")
+        self.assertEqual(other["short"]["value"], 0.0)
+        self.assertEqual(other["weekly"]["value"], 30.69)
+        meta = m.load_state(self.paths)["accounts"]["a"]
+        self.assertEqual(meta["usage_families"]["gemini"]["short"]["value"], 0.62)
+        self.assertTrue(m._is_family_quota_exhausted(meta, family="gemini", now=m.parse_timestamp("2026-11-19T18:00:00+00:00")))
+        self.assertTrue(m._is_family_quota_exhausted(meta, family="other", now=m.parse_timestamp("2026-11-19T18:00:00+00:00")))
+
+    def test_model_quota_failure_keeps_summary_usage(self) -> None:
+        self.add("a")
+        self.token(m.account_dir(self.paths, "a")).write_text(json_token("a"), encoding="utf-8")
+
+        def fake_cloudcode(token, endpoint, body):
+            if endpoint == m.CODE_ASSIST_LOAD_PATH:
+                return {"cloudaicompanionProject": "project-a"}
+            if endpoint == m.CODE_ASSIST_QUOTA_SUMMARY_PATH:
+                return {"groups": [{"displayName": "Claude and GPT models", "buckets": [
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.5, "resetTime": "2026-11-19T22:58:43Z"},
+                ]}]}
+            raise ValueError("Cloud Code request failed with HTTP 500.")
+
+        with mock.patch.object(m, "_cloudcode_request", side_effect=fake_cloudcode), \
+             mock.patch.object(m, "_best_effort_live_identity", return_value=None), \
+             mock.patch.object(m, "ensure_active_account"):
+            result = m.refresh_account_usage(self.paths, "a")
+        self.assertEqual(result.usage_families["other"]["short"]["value"], 50.0)
+        self.assertEqual(result.usage_families["gemini"]["short"]["status"], "unknown")
+
     def test_legacy_usage_windows_migrate_to_gemini_family(self) -> None:
         meta = {
             "usage_windows": {

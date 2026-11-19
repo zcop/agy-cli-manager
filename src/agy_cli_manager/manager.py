@@ -51,7 +51,12 @@ DEFAULT_FAMILY_FALLBACK_STRATEGY = "same-family-first"
 VALID_FAMILY_FALLBACK_STRATEGIES = ("same-family-first", "same-account-first", "strict-family")
 DEFAULT_SWITCH_DEDUPE_SECONDS = 15
 DEFAULT_SWITCH_HISTORY_LIMIT = 20
-CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com"
+# agy talks to the daily Cloud Code backend. The prod host answers quota
+# requests too, but reports every bucket as full, so usage never shows up.
+CODE_ASSIST_BASE_URL = os.environ.get(
+    "AGY_CLI_MANAGER_CODE_ASSIST_BASE_URL",
+    "https://daily-cloudcode-pa.googleapis.com",
+).rstrip("/")
 CODE_ASSIST_USER_AGENT = "antigravity"
 CODE_ASSIST_LOAD_PATH = "/v1internal:loadCodeAssist"
 CODE_ASSIST_QUOTA_PATH = "/v1internal:retrieveUserQuota"
@@ -1036,6 +1041,53 @@ def _parse_quota_families_from_summary(summary_response: dict) -> tuple[dict, in
     return families, bucket_count
 
 
+def _model_quota_family(model_id: str) -> str | None:
+    lowered = model_id.lower()
+    if lowered.startswith("gemini-"):
+        return "gemini"
+    if lowered.startswith(("claude-", "gpt-")):
+        return "other"
+    return None
+
+
+def _parse_quota_families_from_model_buckets(quota_response: dict) -> tuple[dict, int]:
+    """Derive per-family 5h windows from retrieveUserQuota per-model buckets.
+
+    The quota summary only lists some model groups (currently Claude/GPT), so
+    Gemini usage is visible only per model. Models in one family share a pool;
+    the lowest remaining fraction is the one that blocks requests.
+    """
+    families = _default_usage_families()
+    buckets = quota_response.get("buckets")
+    if not isinstance(buckets, list):
+        return families, 0
+    lowest: dict[str, dict] = {}
+    bucket_count = 0
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        family = _model_quota_family(str(bucket.get("modelId") or ""))
+        if family is None or not isinstance(bucket.get("remainingFraction"), (int, float)):
+            continue
+        bucket_count += 1
+        current = lowest.get(family)
+        if current is None or bucket["remainingFraction"] < current["remainingFraction"]:
+            lowest[family] = bucket
+    for family, bucket in lowest.items():
+        families[family]["short"] = _parse_summary_bucket(bucket)
+    return families, bucket_count
+
+
+def _merge_missing_usage_windows(primary: dict, fallback: dict) -> dict:
+    merged = {family: dict(windows) for family, windows in primary.items()}
+    for family, windows in fallback.items():
+        target = merged.setdefault(family, _default_usage_windows())
+        for window_name, window in windows.items():
+            if target.get(window_name, {}).get("status") != "known" and window.get("status") == "known":
+                target[window_name] = window
+    return merged
+
+
 def _parse_quota_windows_from_summary(summary_response: dict) -> tuple[dict, dict, int]:
     families, bucket_count = _parse_quota_families_from_summary(summary_response)
     return families["gemini"]["short"], families["gemini"]["weekly"], bucket_count
@@ -1733,6 +1785,15 @@ def refresh_account_usage(
 
         quota_response = _cloudcode_request(access_token, CODE_ASSIST_QUOTA_SUMMARY_PATH, {"project": project_id})
         usage_families, bucket_count = _parse_quota_families_from_summary(quota_response)
+        if any(windows["short"].get("status") != "known" for windows in usage_families.values()):
+            try:
+                model_quota = _cloudcode_request(access_token, CODE_ASSIST_QUOTA_PATH, {"project": project_id})
+            except (OSError, ValueError):
+                model_quota = None
+            if isinstance(model_quota, dict):
+                model_families, model_bucket_count = _parse_quota_families_from_model_buckets(model_quota)
+                usage_families = _merge_missing_usage_windows(usage_families, model_families)
+                bucket_count += model_bucket_count
         short_window = usage_families["gemini"]["short"]
         weekly_window = usage_families["gemini"]["weekly"]
         plan_info = load_response.get("planInfo")
