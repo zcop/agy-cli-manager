@@ -280,6 +280,52 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertTrue(m._is_family_quota_exhausted(meta, family="gemini", now=m.parse_timestamp("2026-11-19T18:00:00+00:00")))
         self.assertTrue(m._is_family_quota_exhausted(meta, family="other", now=m.parse_timestamp("2026-11-19T18:00:00+00:00")))
 
+    def test_expired_model_bucket_does_not_mask_current_blocking_bucket(self) -> None:
+        now = m.parse_timestamp("2026-11-20T12:00:00+00:00")
+        expired = {"modelId": "gemini-old", "remainingFraction": 0, "resetTime": "2026-11-20T10:00:00Z"}
+        current = {"modelId": "gemini-current", "remainingFraction": 0.02, "resetTime": "2026-11-20T15:00:00Z"}
+        for order in ([expired, current], [current, expired]):
+            with self.subTest(first=order[0]["modelId"]):
+                families, count = m._parse_quota_families_from_model_buckets({"buckets": order}, now=now)
+                self.assertEqual(count, 2)
+                short = families["gemini"]["short"]
+                self.assertEqual(short["value"], 2.0)
+                self.assertEqual(short["reset_at"], "2026-11-20T15:00:00+00:00")
+                self.assertTrue(m._is_family_quota_exhausted({"usage_families": families}, now, family="gemini"))
+
+    def test_expired_model_buckets_are_used_only_without_current_bucket(self) -> None:
+        now = m.parse_timestamp("2026-11-20T12:00:00+00:00")
+        buckets = [
+            {"modelId": "gemini-a", "remainingFraction": 0.5, "resetTime": "2026-11-20T09:00:00Z"},
+            {"modelId": "gemini-b", "remainingFraction": 0, "resetTime": "2026-11-20T10:00:00Z"},
+        ]
+        families, _ = m._parse_quota_families_from_model_buckets({"buckets": buckets}, now=now)
+        self.assertEqual(families["gemini"]["short"]["value"], 0.0)
+        self.assertFalse(m._is_family_quota_exhausted({"usage_families": families}, now, family="gemini"))
+
+    def test_equal_fraction_model_buckets_keep_latest_reset(self) -> None:
+        now = m.parse_timestamp("2026-11-20T12:00:00+00:00")
+        later_check = m.parse_timestamp("2026-11-20T14:00:00+00:00")
+        early = {"modelId": "gemini-2.5-pro", "remainingFraction": 0.01, "resetTime": "2026-11-20T13:00:00Z"}
+        late = {"modelId": "gemini-3-flash", "remainingFraction": 0.01, "resetTime": "2026-11-20T15:00:00Z"}
+        for order in ([early, late], [late, early]):
+            with self.subTest(first=order[0]["modelId"]):
+                families, _ = m._parse_quota_families_from_model_buckets({"buckets": order}, now=now)
+                short = families["gemini"]["short"]
+                self.assertEqual(short["value"], 1.0)
+                self.assertEqual(short["reset_at"], "2026-11-20T15:00:00+00:00")
+                meta = {"usage_families": families}
+                self.assertTrue(m._is_family_quota_exhausted(meta, later_check, family="gemini"))
+
+    def test_equal_fraction_model_bucket_without_reset_counts_as_latest(self) -> None:
+        now = m.parse_timestamp("2026-11-20T12:00:00+00:00")
+        timed = {"modelId": "gemini-2.5-pro", "remainingFraction": 0, "resetTime": "2026-11-20T13:00:00Z"}
+        open_ended = {"modelId": "gemini-3-flash", "remainingFraction": 0}
+        for order in ([timed, open_ended], [open_ended, timed]):
+            with self.subTest(first=order[0]["modelId"]):
+                families, _ = m._parse_quota_families_from_model_buckets({"buckets": order}, now=now)
+                self.assertIsNone(families["gemini"]["short"]["reset_at"])
+
     def test_model_quota_failure_keeps_summary_usage(self) -> None:
         self.add("a")
         self.token(m.account_dir(self.paths, "a")).write_text(json_token("a"), encoding="utf-8")

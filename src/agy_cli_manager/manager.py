@@ -1050,18 +1050,37 @@ def _model_quota_family(model_id: str) -> str | None:
     return None
 
 
-def _parse_quota_families_from_model_buckets(quota_response: dict) -> tuple[dict, int]:
+def _model_window_priority(window: dict, now: datetime) -> tuple[bool, float, float]:
+    """Sort key that puts the per-model window blocking a family longest first.
+
+    A window whose reset already passed no longer blocks, so every current
+    window outranks it. Among the rest the lowest remaining value wins, and on
+    a tie the later reset wins (a missing reset counts as latest, matching
+    `_is_usage_window_exhausted`), so bucket order never decides the result.
+    """
+    reset_at = parse_timestamp(window.get("reset_at"))
+    expired = reset_at is not None and reset_at <= now
+    reset_key = reset_at.timestamp() if reset_at is not None else math.inf
+    return (expired, window["value"], -reset_key)
+
+
+def _parse_quota_families_from_model_buckets(
+    quota_response: dict,
+    now: datetime | None = None,
+) -> tuple[dict, int]:
     """Derive per-family 5h windows from retrieveUserQuota per-model buckets.
 
     The quota summary only lists some model groups (currently Claude/GPT), so
     Gemini usage is visible only per model. Models in one family share a pool;
-    the lowest remaining fraction is the one that blocks requests.
+    the current bucket with the lowest remaining fraction is the one that
+    blocks requests. Expired buckets are kept only when nothing current exists.
     """
+    current = now or utc_now()
     families = _default_usage_families()
     buckets = quota_response.get("buckets")
     if not isinstance(buckets, list):
         return families, 0
-    lowest: dict[str, dict] = {}
+    candidates: dict[str, list[dict]] = {}
     bucket_count = 0
     for bucket in buckets:
         if not isinstance(bucket, dict):
@@ -1070,11 +1089,18 @@ def _parse_quota_families_from_model_buckets(quota_response: dict) -> tuple[dict
         if family is None or not isinstance(bucket.get("remainingFraction"), (int, float)):
             continue
         bucket_count += 1
-        current = lowest.get(family)
-        if current is None or bucket["remainingFraction"] < current["remainingFraction"]:
-            lowest[family] = bucket
-    for family, bucket in lowest.items():
-        families[family]["short"] = _parse_summary_bucket(bucket)
+        try:
+            window = _parse_summary_bucket(bucket)
+        except ValueError:
+            # An unreadable reset must not hide this bucket's fraction; without a
+            # reset it keeps blocking until the next refresh.
+            window = _parse_summary_bucket({**bucket, "resetTime": None})
+        candidates.setdefault(family, []).append(window)
+    for family, windows in candidates.items():
+        families[family]["short"] = min(
+            windows,
+            key=lambda window: _model_window_priority(window, current),
+        )
     return families, bucket_count
 
 
