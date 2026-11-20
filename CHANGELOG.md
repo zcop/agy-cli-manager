@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- isolate file-backed login from the desktop keyring and inherited XDG directories to preserve the active account
+- hold the manager lock during interactive login until shared Secret Service credentials are restored
+
 ## v0.2.3 - 2026-10-03
 
 - parse and persist separate Gemini and Claude/GPT-OSS quota families

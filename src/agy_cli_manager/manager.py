@@ -3151,9 +3151,20 @@ def rotate_after_failure_locked(
     )
 
 
-def _run_interactive_agy_login(runtime_home: Path, resolved_binary: str, timeout_seconds: int) -> None:
+def _run_interactive_agy_login(
+    runtime_home: Path, resolved_binary: str, timeout_seconds: int, *, isolate_keyring: bool = False
+) -> None:
     env = os.environ.copy()
     env["HOME"] = str(runtime_home)
+    for variable, directory in (
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_CACHE_HOME", ".cache"),
+        ("XDG_STATE_HOME", ".local/state"),
+    ):
+        env[variable] = str(runtime_home / directory)
+    if isolate_keyring and sys.platform.startswith("linux"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/agy-cli-manager-isolated-no-keyring"
     env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
     try:
         proc = subprocess.Popen(
@@ -3207,15 +3218,21 @@ def login_account(
 
     resolved_binary = resolve_agy_binary(agy_binary)
     ensure_layout(paths)
-    with manager_lock(paths):
-        login_state = sync_state_from_disk(paths, load_state(paths))
     with tempfile.TemporaryDirectory(prefix="login-", dir=paths.root) as home_string:
         runtime_home = Path(home_string)
         login_dir = runtime_home / ".gemini"
         login_dir.mkdir()
 
-        with _isolated_linux_login_credential(login_state, login_dir):
-            _run_interactive_agy_login(runtime_home, resolved_binary, timeout_seconds)
+        # The desktop credential slot is shared: no switch/capture may run
+        # between its snapshot and restoration, including a failed login.
+        with manager_lock(paths):
+            login_state = sync_state_from_disk(paths, load_state(paths))
+            login_state["credential_backend"] = _effective_credential_backend(login_state)
+            isolate_keyring = login_state["credential_backend"] == "file"
+            with _isolated_linux_login_credential(login_state, login_dir):
+                _run_interactive_agy_login(
+                    runtime_home, resolved_binary, timeout_seconds, isolate_keyring=isolate_keyring
+                )
 
         if not profile_has_login_artifacts(login_dir):
             raise ValueError("agy login did not produce a usable auth profile.")

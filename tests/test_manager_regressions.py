@@ -197,6 +197,36 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertEqual(self.token(self.live_home).read_text(encoding="utf-8"), "token-a")
         self.assertEqual(self.token(m.account_dir(self.paths, "b")).read_text(encoding="utf-8"), "token-b")
 
+    def test_file_login_does_not_inherit_desktop_credentials_or_xdg_paths(self) -> None:
+        self.add("a")
+        original_state = self.paths.state_file.read_bytes()
+        original_runtime = self.token(self.paths.runtime_dir).read_bytes()
+
+        def fake_login(*args, **kwargs):
+            env = kwargs["env"]
+            home = Path(env["HOME"])
+            self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"],
+                             "unix:path=/tmp/agy-cli-manager-isolated-no-keyring")
+            for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+                self.assertTrue(Path(env[variable]).is_relative_to(home))
+            # A failed login must also leave the active profile and state intact.
+            raise FileNotFoundError("simulated login launch failure")
+
+        with mock.patch.dict(m.os.environ, {
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/desktop/bus",
+            "XDG_CONFIG_HOME": str(self.live_home / ".config"),
+            "XDG_DATA_HOME": str(self.live_home / ".local/share"),
+        }), mock.patch.object(m.sys, "platform", "linux"), \
+             mock.patch.object(m, "_effective_credential_backend", return_value="file"), \
+             mock.patch.object(m.os, "isatty", return_value=True), \
+             mock.patch.object(m, "resolve_agy_binary", return_value="/fake/agy"), \
+             mock.patch.object(m.subprocess, "Popen", side_effect=fake_login):
+            with self.assertRaises(ValueError):
+                m.login_account(self.paths, "b", None)
+        self.assertEqual(self.paths.state_file.read_bytes(), original_state)
+        self.assertEqual(self.token(self.paths.runtime_dir).read_bytes(), original_runtime)
+        self.assertEqual(self.token(self.live_home).read_text(), "token-a")
+
     def test_quota_summary_preserves_gemini_and_other_families(self) -> None:
         summary = {
             "groups": [
@@ -417,6 +447,21 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertEqual((login_profile / m.MANAGED_PROFILE_FILES[0]).read_bytes(), captured)
         clear.assert_called_once_with()
         restore.assert_called_once_with(original)
+
+    def test_failed_keyring_login_restores_original_credential(self) -> None:
+        original = json_token("original").encode()
+        login_profile = self.base / "failed-login" / ".gemini"
+        login_profile.mkdir(parents=True)
+        with mock.patch.object(m, "_effective_credential_backend", return_value="secret-service"), \
+             mock.patch.object(m, "_agy_processes_running", return_value=[]), \
+             mock.patch("agy_cli_manager.credential_store.read_linux_live_credential", return_value=original), \
+             mock.patch("agy_cli_manager.credential_store.clear_linux_live_credential"), \
+             mock.patch("agy_cli_manager.credential_store.restore_linux_live_credential") as restore:
+            with self.assertRaises(KeyboardInterrupt):
+                with m._isolated_linux_login_credential({}, login_profile):
+                    raise KeyboardInterrupt
+        restore.assert_called_once_with(original)
+        self.assertFalse((login_profile / m.MANAGED_PROFILE_FILES[0]).exists())
 
     def test_initial_keyring_activation_failure_does_not_publish_account(self) -> None:
         source = self.base / "source-initial"
