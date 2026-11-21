@@ -20,6 +20,23 @@ Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-27T06:29:08Z
 
 
 class QuotaPoolTests(unittest.TestCase):
+    def test_utc_suffix_is_normalized_before_python_iso_parser(self):
+        # Simulate Python 3.10 even when tests run on newer interpreters.
+        native_datetime = m.datetime
+
+        def python310_fromisoformat(value):
+            if value.endswith("Z"):
+                raise ValueError("UTC Z suffix unsupported")
+            return native_datetime.fromisoformat(value)
+
+        with mock.patch.object(m, "datetime", wraps=native_datetime) as datetime_mock:
+            datetime_mock.fromisoformat.side_effect = python310_fromisoformat
+            self.assertEqual(m.parse_timestamp("2026-11-27T06:29:08Z"),
+                             native_datetime(2026, 11, 27, 6, 29, 8, tzinfo=timezone.utc))
+            self.assertEqual(m.parse_timestamp("2026-11-27T08:29:08+02:00").utcoffset().total_seconds(), 7200)
+            self.assertIsNone(m.parse_timestamp("invalid"))
+            datetime_mock.fromisoformat.assert_any_call("2026-11-27T06:29:08+00:00")
+
     def test_opening_and_scrolling_pool_view_does_not_query_agy(self):
         screen = mock.Mock()
         screen.getmaxyx.return_value = (24, 80)

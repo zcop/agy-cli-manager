@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- normalize UTC `Z` timestamps before ISO parsing so quota discovery also works on Python 3.10
 - add quota failover settings (`F`) with pool checkboxes, ANY/ALL rules, remaining thresholds, cache freshness, and explicit save/cancel
 - add a main-screen quota toggle (`B`) and pool overview, plus `quota-policy` CLI/Python interfaces
 - apply fresh pool policy to failover and quota log events; retain the current account when no proven usable replacement exists
