@@ -24,6 +24,7 @@ else:
     import fcntl
 
 from agy_cli_manager.watch import get_log_watch_snapshot
+from agy_cli_manager.quota_policy import normalize_policy as _quota_policy, evaluate as evaluate_quota_policy
 
 
 MANAGED_PROFILE_FILES = (
@@ -403,7 +404,7 @@ def _normalize_switch_runtime(raw: object) -> dict:
         for key in runtime:
             runtime[key] = raw.get(key)
     status = str(runtime.get("status") or "idle").strip().lower()
-    if status not in {"idle", "switching", "ready", "no_account"}:
+    if status not in {"idle", "switching", "ready", "no_account", "no_candidate"}:
         status = "idle"
     runtime["status"] = status
     for key in ("reason", "trigger", "request_id", "active", "previous_active", "last_started_at", "last_completed_at"):
@@ -1365,6 +1366,10 @@ def _best_switch_candidate(
             continue
         if family is not None and _family_cooldown_active(meta, family, current):
             continue
+        pool_policy = _quota_policy(state.get("quota_policy"))
+        if family is None and pool_policy["configured"] and pool_policy["enabled"]:
+            if not evaluate_quota_policy(meta, pool_policy, current)["replacement_usable"]:
+                continue
 
         short_value = _candidate_usage_value(meta, "short", family=family or "gemini")
         weekly_value = _candidate_usage_value(meta, "weekly", family=family or "gemini")
@@ -1544,6 +1549,7 @@ def ensure_active_account(
     snapshot = get_status_snapshot(paths)
     switch_mode = snapshot.get("switch_mode", DEFAULT_SWITCH_MODE)
     switch_policy = snapshot.get("switch_policy") or _default_switch_policy()
+    quota_policy = snapshot.get("quota_policy") or _quota_policy()
     active_name = snapshot.get("active")
     accounts = snapshot.get("accounts", {})
     now = utc_now()
@@ -1625,7 +1631,19 @@ def ensure_active_account(
     if health in {"auth_missing", "auth_expired"}:
         reason = health
         cooldown_minutes = 60
-    elif _is_family_quota_exhausted(
+    elif quota_policy["configured"] and family is None:
+        if _refresh_failure_threshold_reached(
+            active_meta, threshold=int(switch_policy.get("refresh_failure_threshold", DEFAULT_REFRESH_FAILURE_SWITCH_THRESHOLD))
+        ):
+            reason, cooldown_minutes = "refresh_failed", 10
+        else:
+            with manager_lock(paths):
+                state = sync_state_from_disk(paths, load_state(paths))
+                result = _apply_pool_quota_locked(paths, state, force=force)
+            return EnsureActiveResult(bool(result.switched_to), switch_mode, result.previous_active,
+                                      result.active, result.switched_to, result.reason if result.outcome != "not_triggered" else None,
+                                      0, required_family=family)
+    elif quota_policy["enabled"] and _is_family_quota_exhausted(
         active_meta,
         now,
         threshold_percent=float(
@@ -2187,6 +2205,149 @@ def get_account_identity(paths: ManagerPaths, name: str | None = None) -> tuple[
     return resolved_name, refresh_account_identity(paths, resolved_name)
 
 
+def _parse_usage_pools(output: str) -> dict:
+    """Read agy's tab-separated /usage output without guessing pool membership."""
+    pools: dict = {}
+    for line in output.splitlines():
+        fields = line.strip().split("\t")
+        if len(fields) != 4:
+            continue
+        pool, label, remaining, reset = (field.strip() for field in fields)
+        if not pool or not label or not re.fullmatch(r"\d+(?:\.\d+)?%", remaining):
+            continue
+        value = float(remaining[:-1])
+        if not 0 <= value <= 100:
+            continue
+        try:
+            reset_at = _normalize_timestamp(reset)
+        except (ValueError, OverflowError):
+            continue
+        if reset_at is None:
+            continue
+        pools.setdefault(pool, []).append({
+            "label": label, "remaining_percent": value, "reset_at": reset_at,
+        })
+    if not pools:
+        raise ValueError("agy /usage returned no recognized quota rows; cached quotas were preserved.")
+    return pools
+
+
+def get_quota_policy(paths: ManagerPaths) -> dict:
+    return _quota_policy(load_state(paths).get("quota_policy"))
+
+
+def update_quota_policy(paths: ManagerPaths, **changes) -> dict:
+    allowed = {"enabled", "pools", "match", "threshold_percent", "max_age_seconds"}
+    if set(changes) - allowed:
+        raise ValueError("Unknown quota policy field.")
+    with manager_lock(paths):
+        state = load_state(paths)
+        raw = {**_quota_policy(state.get("quota_policy")), **changes, "configured": True}
+        policy = _quota_policy(raw)
+        for key in changes:
+            if raw[key] != policy[key] and key != "pools":
+                raise ValueError(f"Invalid quota policy field: {key}")
+        if "pools" in changes and (not isinstance(changes["pools"], list) or
+                                   any(not isinstance(x, str) or not x.strip() for x in changes["pools"])):
+            raise ValueError("Pools must be a list of nonempty names.")
+        if policy["enabled"] and not policy["pools"]:
+            raise ValueError("Select at least one quota pool before enabling quota failover.")
+        state["quota_policy"] = policy
+        save_state(paths, state)
+    return policy
+
+
+def _apply_pool_quota_locked(paths, state, *, force=False, trigger="quota-policy") -> RotationResult:
+    """Caller holds manager lock. Keep the active profile if no proven replacement exists."""
+    policy = _quota_policy(state.get("quota_policy"))
+    previous = state.get("active")
+    result = RotationResult(previous, previous, None, False, "pool_quota_exhausted", 0, "not_triggered")
+    if (not policy["enabled"] or (get_switch_mode(state) != "auto" and not force) or not previous):
+        return result
+    now = utc_now()
+    if not evaluate_quota_policy(state["accounts"].get(previous, {}), policy, now)["triggered"]:
+        return result
+    candidates = []
+    for name in _eligible_switch_candidates(state, exclude=previous):
+        meta = state["accounts"][name]
+        if _derive_health_status(paths, name, meta) in {"auth_missing", "auth_expired", "disabled", "cooldown"}:
+            continue
+        if evaluate_quota_policy(meta, policy, now)["replacement_usable"]:
+            candidates.append(name)
+    # Retain the existing health/usage ranking among policy-compliant accounts.
+    selected = _best_switch_candidate(paths, state, exclude=previous) if candidates else None
+    if selected:
+        state = _activate_account_locked(paths, state, selected)
+    outcome = "switched" if selected else "no_candidate"
+    _mark_switch_runtime(state, status="ready" if selected else "no_candidate",
+                         reason=result.reason, trigger=trigger, active=state.get("active"),
+                         previous_active=previous, started_at=now.isoformat(), completed_at=utc_now().isoformat())
+    _append_switch_history(state, reason=result.reason, trigger=trigger, request_id=None, previous_active=previous,
+                           active=state.get("active"), switched_to=selected, outcome=outcome, cooldown_minutes=0)
+    save_state(paths, state)
+    return RotationResult(previous, state.get("active"), selected, False, result.reason, 0, outcome)
+
+
+def get_account_quota_pools(paths: ManagerPaths, name: str | None = None) -> dict:
+    state = sync_state_from_disk(paths, load_state(paths))
+    account_name, _source = _resolve_usage_refresh_target(paths, state, name)
+    meta = state["accounts"][account_name]
+    return {
+        "account": account_name,
+        "pools": meta.get("quota_pools", {}),
+        "refreshed_at": meta.get("quota_pools_refreshed_at"),
+        "source": "agy /usage" if meta.get("quota_pools_refreshed_at") else None,
+        "evaluation": evaluate_quota_policy(meta, state.get("quota_policy")),
+    }
+
+
+def refresh_account_quota_pools(
+    paths: ManagerPaths, name: str | None = None,
+    agy_binary: str | None = None, timeout_seconds: int = 30,
+) -> dict:
+    """Explicit non-PTY refresh; distinct pools do not change routing policy."""
+    if timeout_seconds <= 0:
+        raise ValueError("Quota refresh timeout must be positive.")
+    resolved_binary = resolve_agy_binary(agy_binary)
+    # Serialize against replacing/removing this profile while agy uses its home.
+    with manager_lock(paths):
+        state = sync_state_from_disk(paths, load_state(paths))
+        account_name, _source = _resolve_usage_refresh_target(paths, state, name)
+        source_home = account_dir(paths, account_name)
+        if not profile_has_login_artifacts(source_home / ".gemini"):
+            raise ValueError(f"Saved account has no usable credential: {account_name}")
+        env = os.environ.copy()
+        env["HOME"] = str(source_home)
+        for variable, directory in (
+            ("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_CACHE_HOME", ".cache"), ("XDG_STATE_HOME", ".local/state"),
+        ):
+            env[variable] = str(source_home / directory)
+        if sys.platform.startswith("linux"):
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/agy-cli-manager-isolated-no-keyring"
+        try:
+            proc = subprocess.run(
+                [resolved_binary, "-p", "/usage"], cwd=source_home, env=env,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=timeout_seconds, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(f"agy /usage timed out after {timeout_seconds} seconds.") from exc
+        except OSError as exc:
+            raise ValueError("Unable to launch agy /usage.") from exc
+        if proc.returncode != 0:
+            raise ValueError(f"agy /usage failed with exit code {proc.returncode}; cached quotas were preserved.")
+        pools = _parse_usage_pools(proc.stdout)
+        # Reload because the profile's token may have been refreshed by agy.
+        state = sync_state_from_disk(paths, load_state(paths))
+        meta = state["accounts"][account_name]
+        meta["quota_pools"] = pools
+        meta["quota_pools_refreshed_at"] = utc_now().isoformat()
+        save_state(paths, state)
+    ensure_active_account(paths)
+    return get_account_quota_pools(paths, account_name)
+
+
 def probe_profile_identity_via_usage(
     source_dir: Path,
     agy_binary: str | None = None,
@@ -2655,6 +2816,9 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
             "refresh_fail_count": int(meta.get("refresh_fail_count", 0) or 0),
             "created_at": meta.get("created_at"),
             "usage_families": _normalize_usage_families(meta),
+            "quota_pools": meta.get("quota_pools", {}),
+            "quota_pools_refreshed_at": meta.get("quota_pools_refreshed_at"),
+            "quota_evaluation": evaluate_quota_policy(meta, state.get("quota_policy")),
             "usage_windows": _normalize_usage_windows(meta),
             "usage_status": meta.get("usage_status", "unknown"),
             "usage_value": meta.get("usage_value"),
@@ -2683,6 +2847,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "active_proxy": _normalize_proxy_config(active_meta.get("proxy")) if isinstance(active_meta, dict) else _default_proxy_config(),
         "switch_mode": get_switch_mode(state),
         "switch_policy": _state_switch_policy(state),
+        "quota_policy": _quota_policy(state.get("quota_policy")),
         "switch_runtime": _normalize_switch_runtime(state.get("switch_runtime")),
         "switch_history": _normalize_switch_history(state.get("switch_history")),
         "log_watch": get_log_watch_snapshot(paths),

@@ -22,6 +22,10 @@ from agy_cli_manager.manager import (
     ensure_layout,
     format_status,
     get_account_identity,
+    get_account_quota_pools,
+    refresh_account_quota_pools,
+    get_quota_policy,
+    update_quota_policy,
     get_account_proxy,
     get_credential_status,
     get_live_dir,
@@ -128,6 +132,19 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_usage.add_argument("--agy-binary")
     refresh_usage.add_argument("--warmup-timeout-seconds", type=int, default=45)
     refresh_usage.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    pools = sub.add_parser("quota-pools", help="Show cached quota pools; optionally refresh using agy /usage")
+    pools.add_argument("name", nargs="?")
+    pools.add_argument("--refresh", action="store_true", help="Explicitly query agy without a PTY")
+    pools.add_argument("--agy-binary")
+    pools.add_argument("--timeout-seconds", type=int, default=30)
+    pools.add_argument("--json", action="store_true")
+    quota_policy = sub.add_parser("quota-policy", help="Configure cached pool quota failover")
+    quota_policy.add_argument("--enabled", choices=("on", "off"))
+    quota_policy.add_argument("--pool", action="append", help="Exact pool name; repeat for multiple pools")
+    quota_policy.add_argument("--match", choices=("any", "all"))
+    quota_policy.add_argument("--threshold", type=float)
+    quota_policy.add_argument("--max-age-seconds", type=int)
+    quota_policy.add_argument("--json", action="store_true")
     refresh_due = sub.add_parser("refresh-due", help="Refresh the first due eligible account and persist cached usage metadata")
     refresh_due.add_argument("--agy-binary")
     refresh_due.add_argument("--warmup-timeout-seconds", type=int, default=45)
@@ -807,6 +824,9 @@ def _draw_action_bar(stdscr, y: int) -> int:
         ("Y", "AckRestart"),
         ("S", "Sort"),
         ("U", "Live Usage Refresh"),
+        ("V", "Quota Pools"),
+        ("B", "Quota On/Off"),
+        ("F", "Quota Settings"),
         ("T", "UI Refresh"),
         ("Q", "Quit"),
     ]
@@ -1301,6 +1321,132 @@ def _run_dashboard_terminal_action(stdscr, fn):
         stdscr.refresh()
 
 
+def _quota_policy_summary(policy: dict) -> str:
+    if not policy["configured"]:
+        return "Legacy Gemini policy | F configure pools"
+    return f"{'ON' if policy['enabled'] else 'OFF'} | {policy['match'].upper()} of {len(policy['pools'])} checked | <= {policy['threshold_percent']:g}%"
+
+
+def _quota_policy_dashboard(stdscr, paths) -> None:
+    # Work on a local draft. Only S writes manager policy.
+    policy = get_quota_policy(paths)
+    snapshot = get_status_snapshot(paths)
+    names = sorted(set(policy["pools"]) | {
+        name for meta in snapshot["accounts"].values() for name in meta.get("quota_pools", {})
+    })
+    checked = set(policy["pools"])
+    selected = 0
+    message = "Space checkbox | A select all | C clear | S save | Esc cancel"
+    while True:
+        height, width = stdscr.getmaxyx()
+        stdscr.erase()
+        _safe_addstr(stdscr, 0, 0, "Quota Failover Settings", _color_attr(COLOR_SECTION, curses.A_BOLD))
+        _safe_addstr(stdscr, 1, 0, f"E Enabled: {'ON' if policy['enabled'] else 'OFF'} | M Trigger: {policy['match'].upper()} checked")
+        _safe_addstr(stdscr, 2, 0, f"+/- Remaining threshold: {policy['threshold_percent']:g}% | [/ ] Cache max age: {policy['max_age_seconds']:g}s")
+        _safe_addstr(stdscr, 3, 0, "Up/Down select pool. New pools start unchecked. No live requests here.")
+        page = max(1, height - 7)
+        start = max(0, selected - page + 1)
+        for index, name in enumerate(names[start:start + page], start):
+            prefix = ">" if index == selected else " "
+            _safe_addstr(stdscr, 5 + index - start, 0, f"{prefix} [{'x' if name in checked else ' '}] {name}")
+        if not names:
+            _safe_addstr(stdscr, 5, 0, "No discovered pools. Use V, then U to refresh an account first.")
+        _safe_addstr(stdscr, height - 1, 0, message)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord('q'), ord('Q')):
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            selected = min(max(0, len(names) - 1), selected + 1)
+        elif key in (curses.KEY_UP, ord('k')):
+            selected = max(0, selected - 1)
+        elif key == ord(' ') and names:
+            name = names[selected]
+            checked.symmetric_difference_update({name})
+        elif key in (ord('a'), ord('A')):
+            checked = set(names)
+        elif key in (ord('c'), ord('C')):
+            checked.clear()
+        elif key in (ord('e'), ord('E')):
+            policy['enabled'] = not policy['enabled']
+        elif key in (ord('m'), ord('M')):
+            policy['match'] = 'all' if policy['match'] == 'any' else 'any'
+        elif key in (ord('+'), ord('='), ord('-')):
+            policy['threshold_percent'] = max(0, min(100, policy['threshold_percent'] + (-1 if key == ord('-') else 1)))
+        elif key in (ord('['), ord(']')):
+            policy['max_age_seconds'] = max(60, min(86400, policy['max_age_seconds'] + (-60 if key == ord('[') else 60)))
+        elif key in (ord('s'), ord('S')):
+            try:
+                update_quota_policy(paths, enabled=policy['enabled'], pools=sorted(checked),
+                                    match=policy['match'], threshold_percent=policy['threshold_percent'],
+                                    max_age_seconds=policy['max_age_seconds'])
+                return
+            except ValueError as exc:
+                message = str(exc)
+        elif key == -1:
+            time.sleep(0.1)
+
+
+def _quota_pool_lines(payload: dict, now: datetime) -> list[str]:
+    lines = []
+    for pool, limits in payload.get("pools", {}).items():
+        lines.append(pool)
+        for limit in limits:
+            reset = _parse_iso_timestamp(limit.get("reset_at"))
+            if reset is None:
+                countdown = "unknown"
+            else:
+                seconds = max(0, int((reset - now).total_seconds()))
+                days, seconds = divmod(seconds, 86400)
+                hours, seconds = divmod(seconds, 3600)
+                minutes = seconds // 60
+                countdown = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+                if reset <= now:
+                    countdown = "due; refresh needed"
+            lines.append(f"  {limit['label']}: {limit['remaining_percent']:g}% remaining")
+            lines.append(f"    Reset in {countdown} | {limit['reset_at']}")
+    return lines or ["No cached pools. Press U to fetch agy /usage."]
+
+
+def _quota_pools_dashboard(stdscr, paths, name: str) -> None:
+    offset = 0
+    message = "Cached data only. U queries this account; Esc returns."
+    while True:
+        payload = get_account_quota_pools(paths, name)
+        height, width = stdscr.getmaxyx()
+        lines = _quota_pool_lines(payload, datetime.now(timezone.utc))
+        wrapped = [part for line in lines for part in textwrap.wrap(line, max(1, width - 2))]
+        page = max(1, height - 5)
+        offset = max(0, min(offset, len(wrapped) - page))
+        stdscr.erase()
+        _safe_addstr(stdscr, 0, 0, f"Quota Pools | {name} | U Refresh | Up/Down Scroll | Esc Back",
+                     _color_attr(COLOR_SECTION, curses.A_BOLD))
+        _safe_addstr(stdscr, 1, 0, f"Source: {payload.get('source') or '-'} | Cached at: {payload.get('refreshed_at') or '-'}")
+        for row, line in enumerate(wrapped[offset:offset + page], 3):
+            _safe_addstr(stdscr, row, 0, line)
+        _safe_addstr(stdscr, height - 1, 0, message)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord('v'), ord('V'), ord('q'), ord('Q')):
+            return
+        if key in (curses.KEY_DOWN, ord('j')):
+            offset += 1
+        elif key in (curses.KEY_UP, ord('k')):
+            offset -= 1
+        elif key == curses.KEY_NPAGE:
+            offset += page
+        elif key == curses.KEY_PPAGE:
+            offset -= page
+        elif key in (ord('u'), ord('U')):
+            try:
+                _run_dashboard_terminal_action(stdscr, lambda: refresh_account_quota_pools(paths, name))
+                message = "Quota pools refreshed. These pools are separate from family routing policy."
+            except (ValueError, KeyboardInterrupt) as exc:
+                message = "Cancelled." if isinstance(exc, KeyboardInterrupt) else str(exc)
+        elif key == -1:
+            time.sleep(0.1)
+
+
 def _dashboard_login(paths) -> str:
     print("\n[agy-cli-manager] Login Account\n")
     name = prompt_nonempty("Account name")
@@ -1569,6 +1715,25 @@ def _dashboard(stdscr, paths) -> int:
                 ("Issues", "none", _severity_attr("good", bold=True)),
             ]
 
+        if accounts:
+            pool_count = len(selected_meta.get("quota_pools", {}))
+            if pool_count:
+                old_labels = {"Usage", "Gemini", "Other", "Gemini 5h", "Gemini Week", "Other 5h", "Other Week"}
+                overview_rows = [row for row in overview_rows if row[0] not in old_labels]
+                for pool, limits in selected_meta["quota_pools"].items():
+                    values = []
+                    for limit in limits:
+                        label = limit.get("label", "Limit")
+                        window = "5h" if "five hour" in label.lower() else "wk" if "weekly" in label.lower() else label
+                        reset = _parse_iso_timestamp(limit.get('reset_at'))
+                        refreshed = _parse_iso_timestamp(selected_meta.get('quota_pools_refreshed_at'))
+                        max_age = snapshot['quota_policy']['max_age_seconds']
+                        stale = (refreshed is None or not 0 <= (now_dt - refreshed).total_seconds() <= max_age
+                                 or reset is None or reset <= now_dt)
+                        values.append(f"{window} {limit['remaining_percent']:g}%{' (stale)' if stale else ''}")
+                    overview_rows.append((pool, " | ".join(values), _severity_attr("info")))
+            overview_rows.append(("Pools [V]", f"{pool_count} cached | V view all, U inside to refresh", _severity_attr("info")))
+        overview_rows.append(("Quota B/F", _quota_policy_summary(snapshot["quota_policy"]), _severity_attr("info")))
         overview_panel_height = 1 + len(overview_rows)
 
         overview_top = max(header_y + 3, (height - 2) - overview_panel_height)
@@ -1607,7 +1772,7 @@ def _dashboard(stdscr, paths) -> int:
                 label,
                 value,
                 value_attr,
-                label_width=8,
+                label_width=min(24, max(len(row[0]) for row in overview_rows)),
             )
 
         _draw_hline(stdscr, height - 2, "=")
@@ -1687,6 +1852,23 @@ def _dashboard(stdscr, paths) -> int:
             continue
         if key in (ord("p"), ord("P")):
             return _proxy_dashboard(stdscr, paths)
+        if key in (ord("f"), ord("F")):
+            _quota_policy_dashboard(stdscr, paths)
+            snapshot = _refresh_dashboard_snapshot(paths)
+            message = _quota_policy_summary(snapshot['quota_policy'])
+            continue
+        if key in (ord("b"), ord("B")):
+            try:
+                policy = get_quota_policy(paths)
+                if not policy['configured']:
+                    _quota_policy_dashboard(stdscr, paths)
+                else:
+                    update_quota_policy(paths, enabled=not policy['enabled'])
+                snapshot = _refresh_dashboard_snapshot(paths)
+                message = _quota_policy_summary(snapshot['quota_policy'])
+            except ValueError as exc:
+                message = str(exc)
+            continue
         if key in (ord("y"), ord("Y")):
             clear_restart_required(paths)
             snapshot = _refresh_dashboard_snapshot(paths)
@@ -1700,7 +1882,10 @@ def _dashboard(stdscr, paths) -> int:
         selected_name, selected_meta = accounts[selected_idx]
 
         try:
-            if key in (ord("u"), ord("U")):
+            if key in (ord("v"), ord("V")):
+                _quota_pools_dashboard(stdscr, paths, selected_name)
+                message = "Returned from quota pools."
+            elif key in (ord("u"), ord("U")):
                 if refresh_inflight_name is not None:
                     message = f"Refresh already running for {refresh_inflight_name}."
                 else:
@@ -2106,6 +2291,29 @@ def main() -> int:
                 print(json.dumps(payload, indent=2, sort_keys=True))
             else:
                 print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == "quota-policy":
+            changes = {}
+            for argument, field in (("pool", "pools"), ("match", "match"), ("threshold", "threshold_percent"),
+                                    ("max_age_seconds", "max_age_seconds")):
+                value = getattr(args, argument)
+                if value is not None:
+                    changes[field] = value
+            if args.enabled is not None:
+                changes['enabled'] = args.enabled == 'on'
+            payload = update_quota_policy(paths, **changes) if changes else get_quota_policy(paths)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        if args.command == "quota-pools":
+            payload = (
+                refresh_account_quota_pools(paths, args.name, args.agy_binary, args.timeout_seconds)
+                if args.refresh else get_account_quota_pools(paths, args.name)
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(f"account: {payload['account']} | cached_at: {payload['refreshed_at'] or '-'}")
+                print("\n".join(_quota_pool_lines(payload, datetime.now(timezone.utc))))
             return 0
         if args.command == "refresh-usage":
             result = refresh_account_usage(

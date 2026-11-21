@@ -358,6 +358,8 @@ def poll_quota_logs(
         load_state,
         manager_lock,
         rotate_after_failure_locked,
+        _quota_policy,
+        _apply_pool_quota_locked,
     )
 
     on_rotate_cmd = None
@@ -397,9 +399,11 @@ def poll_quota_logs(
             elif events and ignored_logs:
                 message = "agy restart detected; old quota errors ignored"
         elif events_for_rotate:
-            should_rotate = rotate and (force_switch or switch_mode == "auto")
+            quota_policy = _quota_policy(state.get("quota_policy"))
+            should_rotate = rotate and quota_policy["enabled"] and (force_switch or switch_mode == "auto")
             if should_rotate:
-                rotation = rotate_after_failure_locked(
+                rotation = (_apply_pool_quota_locked(paths, state, force=force_switch, trigger="log-watch")
+                            if quota_policy["configured"] else rotate_after_failure_locked(
                     paths,
                     reason="quota",
                     cooldown_minutes=cooldown_minutes,
@@ -408,7 +412,7 @@ def poll_quota_logs(
                     # repeated lines. A new session can fail immediately.
                     dedupe_seconds=0,
                     trigger="log-watch",
-                )
+                ))
                 rotated = rotation.outcome == "switched"
                 if rotated:
                     _arm_restart(

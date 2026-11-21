@@ -53,27 +53,63 @@ Project links:
 
 ## Install
 
+The manager runs as your normal user; it does not require root or a system
+service. Python 3.10+ must be installed. A virtual environment keeps the package
+separate from system Python, but you do not need to activate one manually when
+using `pipx`.
+
+### Recommended: user installation with pipx
+
+With `pipx` installed, install the release wheel:
+
+```bash
+pipx install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+pipx ensurepath
+```
+
+Open a new terminal after `ensurepath`, then run:
+
+```bash
+agy-cli-manager --help
+agy-cli-manager dashboard
+```
+
+`pipx` manages a private Python environment and exposes the command on your user
+`PATH`. No environment activation is needed. Run the manager as the same user who
+runs `agy`; its default data directory is `~/.agy-cli-manager`.
+
+To replace an existing pipx installation with this release:
+
+```bash
+pipx install --force https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+```
+
+### Alternative: explicit virtual environment
+
 From a GitHub release wheel:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.2/agy_cli_manager-0.2.2-py3-none-any.whl
+python -m pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
 ```
 
 To upgrade an existing installation to this release:
 
 ```bash
-pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.2/agy_cli_manager-0.2.2-py3-none-any.whl
+python -m pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
 ```
 
-From this repo:
+Activate that environment in each new terminal, or run `.venv/bin/agy-cli-manager`
+directly without activation. Avoid `sudo pip install` into system Python.
+
+### From this repo
 
 ```bash
 cd agy-cli-manager
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e .
+python -m pip install -e .
 ```
 
 After that, you can use either:
@@ -89,6 +125,86 @@ PYTHONPATH=src python3 -m agy_cli_manager.cli --help
 ```
 
 ## Quick Start
+
+### View all reported quota pools
+
+In the dashboard, select an account and press `V` to open **Quota Pools**.
+Each reported pool has its own limits, remaining percentages, and reset
+countdowns. Use Up/Down or Page Up/Page Down to scroll, `U` to fetch fresh data,
+and Esc to return. Opening the view and redrawing countdowns use cached data
+only; they do not launch `agy` or make network requests.
+
+With `agy` 1.5.13, the live output includes Gemini Models (five-hour and weekly),
+Claude and GPT models (five-hour and weekly), and Gemini 4 Argon (weekly only).
+Pool names and limits are discovered from `agy -p /usage`, so future pools are
+shown separately too. A missing five-hour limit is not treated as 100% available.
+
+The same data is available from the CLI:
+
+```bash
+# Read the selected account's cached pools, without a live query.
+agy-cli-manager quota-pools my-account --json
+# Explicitly refresh this account using a bounded, non-PTY agy subprocess.
+agy-cli-manager quota-pools my-account --refresh --timeout-seconds 30 --json
+```
+
+Omit the name to use the active saved account. The Python API exports
+`get_account_quota_pools()` and `refresh_account_quota_pools()`. State/JSON uses
+additive `quota_pools` and `quota_pools_refreshed_at` fields. Refresh failures keep
+the previous cached values and timestamp. The view marks past reset times as
+due rather than assuming the quota has replenished.
+
+The main overview shows every cached pool for the selected account. `V` opens
+the full limits/reset view; `U` inside it explicitly refreshes pool data. `U` on
+the main screen retains the existing Cloud Code family refresh.
+
+### Configure quota failover
+
+Press `F` on the main dashboard to open **Quota Failover Settings**:
+
+- Up/Down selects a pool; Space checks or unchecks it.
+- `A` checks all currently discovered pools; `C` clears the selection. Newly
+  discovered pools start unchecked, including after using Select All.
+- `E` enables/disables quota switching. `M` chooses ANY or ALL checked pools.
+- `+`/`-` changes the remaining-quota threshold; `[`/`]` changes cache freshness.
+- `S` saves the draft; Esc cancels without changing policy.
+
+Checking one pool targets that pool. ANY switches when at least one checked
+pool is exhausted, and requires every checked pool to be available on the
+replacement. ALL switches only when every checked pool is exhausted, and
+requires at least one checked pool available on the replacement. A pool is
+exhausted when any reported limit is at or below the threshold. Weekly-only
+Argon is evaluated on its weekly limit, independently of ordinary Gemini.
+
+`B` on the main screen toggles the saved quota policy; on first use it opens
+settings. Quota failover also requires switch mode Auto (`W`). Authentication
+and refresh failures remain separate triggers when quota switching is off.
+Log-watcher quota events obey the saved pool policy rather than bypassing it.
+
+Unknown, expired, future-dated, or stale cache values do not prove that a pool
+is available or exhausted. The default cache maximum age is 1800 seconds. No
+network request is made when editing settings or evaluating policy. Refresh
+the active and standby accounts through `V`, then `U`, or the CLI to provide
+fresh evidence for switching. If no standby satisfies the rule, the current
+account remains selected and switch history records `no_candidate`.
+
+Existing installations retain their legacy family policy until pool settings
+are saved. Explicit `--family` requests and `resolve-route` retain the existing
+Gemini/Other caller API; selecting pools here switches accounts, not models.
+
+CLI and Python integrations can configure the same policy:
+
+```bash
+agy-cli-manager quota-policy --enabled on --match any \
+  --pool "Gemini Models" --pool "Gemini 4 Argon" --threshold 10 --max-age-seconds 1800 --json
+agy-cli-manager ensure-active --json
+agy-cli-manager quota-policy --enabled off --json
+```
+
+The Python exports are `get_quota_policy()` and `update_quota_policy()`; status
+JSON includes `quota_policy`, per-account `quota_pools`, and `quota_evaluation`.
+Saving policy does not immediately switch accounts; the next ensure-active,
+successful pool refresh, family refresh, or quota log event evaluates it.
 
 ### 1. Initialize the manager state
 

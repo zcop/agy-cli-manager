@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- add quota failover settings (`F`) with pool checkboxes, ANY/ALL rules, remaining thresholds, cache freshness, and explicit save/cancel
+- add a main-screen quota toggle (`B`) and pool overview, plus `quota-policy` CLI/Python interfaces
+- apply fresh pool policy to failover and quota log events; retain the current account when no proven usable replacement exists
+- add a scrollable Quota Pools view (`V`) with explicit `agy /usage` refresh (`U`), discovered pool names, remaining percentages, and independent reset times
+- expose cached pool metadata through `quota-pools [name] [--refresh] --json` and Python APIs, including separate Gemini 4 Argon tracking
 - isolate file-backed login from the desktop keyring and inherited XDG directories to preserve the active account
 - hold the manager lock during interactive login until shared Secret Service credentials are restored
 
