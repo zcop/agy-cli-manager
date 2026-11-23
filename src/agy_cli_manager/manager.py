@@ -3034,6 +3034,38 @@ def update_switch_policy(
         return dict(policy)
 
 
+def remove_account(paths: ManagerPaths, name: str) -> dict:
+    """Remove a standby profile with a private recovery copy outside accounts/."""
+    with manager_lock(paths):
+        target = account_dir(paths, name)
+        state = sync_state_from_disk(paths, load_state(paths))
+        if name not in state["accounts"] or not target.is_dir():
+            raise ValueError(f"Account not found: {name}")
+        if state.get("active") == name:
+            raise ValueError("Cannot remove the active account. Switch to another account first.")
+        live_dir = get_live_dir(state)
+        protected = [paths.runtime_dir.resolve()]
+        if live_dir is not None:
+            protected.append(live_dir.resolve())
+        if any(path == target.resolve() or target.resolve() in path.parents for path in protected):
+            raise ValueError("Cannot remove an account used as the live or runtime directory.")
+        recovery = paths.root / "removed-accounts"
+        if recovery.is_symlink():
+            raise ValueError("Recovery directory cannot be a symlink.")
+        recovery.mkdir(mode=0o700, exist_ok=True)
+        recovery.chmod(0o700)
+        archived = Path(tempfile.mkdtemp(prefix="removed-", dir=recovery)) / "profile"
+        target.rename(archived)
+        del state["accounts"][name]
+        try:
+            save_state(paths, state)
+        except BaseException:
+            archived.rename(target)
+            archived.parent.rmdir()
+            raise
+        return {"account": name, "removed": True, "recovery_path": str(archived)}
+
+
 def set_enabled(paths: ManagerPaths, name: str, enabled: bool) -> None:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))

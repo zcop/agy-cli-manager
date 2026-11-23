@@ -58,6 +58,58 @@ class ManagerRegressionTests(unittest.TestCase):
             m.save_account_profile(self.paths, "linked", self.base / "source-a", overwrite=True)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_remove_standby_preserves_active_and_retains_private_recovery(self):
+        self.add("a")
+        self.add("b")
+        live = self.token(self.live_home).read_bytes()
+        runtime = self.token(self.paths.runtime_dir).read_bytes()
+        result = m.remove_account(self.paths, "b")
+        self.assertTrue(result["removed"])
+        self.assertFalse(m.account_dir(self.paths, "b").exists())
+        self.assertNotIn("b", m.get_status_snapshot(self.paths)["accounts"])
+        self.assertEqual(m.load_state(self.paths)["active"], "a")
+        self.assertEqual(self.token(self.live_home).read_bytes(), live)
+        self.assertEqual(self.token(self.paths.runtime_dir).read_bytes(), runtime)
+        self.assertEqual(self.token(Path(result["recovery_path"])).read_text(), "token-b")
+        self.assertEqual(Path(result["recovery_path"]).parent.stat().st_mode & 0o777, 0o700)
+
+    def test_remove_refuses_active_missing_unsafe_and_live_profiles(self):
+        self.add("a")
+        self.add("b")
+        before = self.paths.state_file.read_bytes()
+        for name in ("a", "missing", "../a"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.remove_account(self.paths, name)
+        self.assertEqual(self.paths.state_file.read_bytes(), before)
+        (self.paths.accounts_dir / "linked").symlink_to(self.base / "source-b", target_is_directory=True)
+        with self.assertRaises(ValueError):
+            m.remove_account(self.paths, "linked")
+        state = m.load_state(self.paths)
+        state["live_dir"] = str(m.account_dir(self.paths, "b") / ".gemini")
+        m.save_state(self.paths, state)
+        with self.assertRaises(ValueError):
+            m.remove_account(self.paths, "b")
+
+    def test_remove_state_failure_restores_saved_profile(self):
+        self.add("a")
+        self.add("b")
+        before = self.paths.state_file.read_bytes()
+        with mock.patch.object(m, "save_state", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                m.remove_account(self.paths, "b")
+        self.assertEqual(self.paths.state_file.read_bytes(), before)
+        self.assertEqual(self.token(m.account_dir(self.paths, "b")).read_text(), "token-b")
+
+    def test_remove_confirmation_requires_exact_name(self):
+        from agy_cli_manager import cli
+        self.add("a")
+        self.add("b")
+        with mock.patch("builtins.input", return_value="yes"), redirect_stdout(io.StringIO()):
+            self.assertIsNone(cli._confirm_remove_account(self.paths, "b"))
+        self.assertTrue(m.account_dir(self.paths, "b").exists())
+        with mock.patch("builtins.input", return_value="b"), redirect_stdout(io.StringIO()):
+            self.assertTrue(cli._confirm_remove_account(self.paths, "b")["removed"])
+
     def test_interrupted_state_write_keeps_previous_state(self) -> None:
         self.add("a")
         old_state = self.paths.state_file.read_text(encoding="utf-8")

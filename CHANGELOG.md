@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- add confirmed standby account removal (`D` in the TUI, `remove` CLI, and Python API) with private recovery copies and active-account protection
 - normalize UTC `Z` timestamps before ISO parsing so quota discovery also works on Python 3.10
 - add quota failover settings (`F`) with pool checkboxes, ANY/ALL rules, remaining thresholds, cache freshness, and explicit save/cancel
 - add a main-screen quota toggle (`B`) and pool overview, plus `quota-policy` CLI/Python interfaces

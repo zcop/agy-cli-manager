@@ -37,6 +37,7 @@ from agy_cli_manager.manager import (
     login_account,
     load_state,
     mark_bad,
+    remove_account,
     probe_profile_identity_via_usage,
     refresh_account_usage,
     refresh_due_account,
@@ -185,6 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     disable = sub.add_parser("disable", help="Disable an account")
     disable.add_argument("name")
+    remove = sub.add_parser("remove", help="Remove a standby account, retaining a private recovery copy")
+    remove.add_argument("name")
+    remove.add_argument("--yes", action="store_true", help="Confirm removal without prompting")
+    remove.add_argument("--json", action="store_true")
 
     enable = sub.add_parser("enable", help="Enable an account")
     enable.add_argument("name")
@@ -818,6 +823,7 @@ def _draw_action_bar(stdscr, y: int) -> int:
         ("Enter/A", "Activate"),
         ("R", "Rotate"),
         ("E", "Enable/Disable"),
+        ("D", "Remove"),
         ("C", "ClearBad"),
         ("M", "MarkBad"),
         ("W", "Mode"),
@@ -1456,6 +1462,15 @@ def _dashboard_login(paths) -> str:
     return f"{'logged-in' if stored_name else 'cancelled'}: {stored_name or name}"
 
 
+def _confirm_remove_account(paths, name: str) -> dict | None:
+    if get_status_snapshot(paths).get("active") == name:
+        raise ValueError("Cannot remove the active account. Switch to another account first.")
+    print(f"Remove saved account '{name}'? A private recovery copy will be retained.")
+    if input("Type the account name to confirm (Enter cancels): ").strip() != name:
+        return None
+    return remove_account(paths, name)
+
+
 def _dashboard_import(paths) -> str:
     print("\n[agy-cli-manager] Import Current/Live Profile\n")
     name = prompt_nonempty("Account name")
@@ -1907,6 +1922,15 @@ def _dashboard(stdscr, paths) -> int:
                 enabled = bool(selected_meta.get("enabled", True))
                 set_enabled(paths, selected_name, not enabled)
                 message = f"{'Enabled' if not enabled else 'Disabled'} {selected_name}."
+            elif key in (ord("d"), ord("D")):
+                if refresh_inflight_name is not None:
+                    message = "Wait for the usage refresh to finish before removing an account."
+                    continue
+                try:
+                    result = _run_dashboard_terminal_action(stdscr, lambda: _confirm_remove_account(paths, selected_name))
+                    message = f"Removed {selected_name}; recovery: {result['recovery_path']}" if result else "Removal cancelled."
+                except (KeyboardInterrupt, EOFError):
+                    message = "Removal cancelled."
             elif key in (ord("c"), ord("C")):
                 clear_bad(paths, selected_name)
                 message = f"Cleared bad state for {selected_name}."
@@ -2443,6 +2467,22 @@ def main() -> int:
                 print(json.dumps({"active": target}, indent=2, sort_keys=True))
             else:
                 print(f"rotated: {target}")
+            return 0
+        if args.command == "remove":
+            if args.yes:
+                payload = remove_account(paths, args.name)
+            elif not sys.stdin.isatty():
+                raise ValueError("Account removal requires confirmation; use --yes for non-interactive callers.")
+            else:
+                payload = _confirm_remove_account(paths, args.name)
+            if payload is None:
+                payload = {"account": args.name, "removed": False}
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            elif payload['removed']:
+                print(f"removed: {args.name}; recovery: {payload['recovery_path']}")
+            else:
+                print("Removal cancelled.")
             return 0
         if args.command == "disable":
             set_enabled(paths, args.name, False)

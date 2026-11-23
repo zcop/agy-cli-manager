@@ -126,6 +126,27 @@ PYTHONPATH=src python3 -m agy_cli_manager.cli --help
 
 ## Quick Start
 
+### Remove a saved account
+
+Select a standby account in the dashboard and press `D`. Type its exact name
+to confirm; Enter cancels. Switch to another account before removing the active
+one. Wait for any dashboard usage refresh to finish before removing an account.
+
+```bash
+agy-cli-manager remove old-account
+# Explicit confirmation for automation:
+agy-cli-manager remove old-account --yes --json
+```
+
+Removal unregisters the account and moves its saved profile into a private
+`~/.agy-cli-manager/removed-accounts/` recovery directory (under `--root` when
+overridden). The returned `recovery_path` still contains credentials; removal
+does not securely erase them or revoke the Google login. The live profile,
+runtime, OS keyring, other accounts, and switch history are preserved. The
+Python API is `remove_account(paths, name)`. A recovery profile can be imported
+again with `agy-cli-manager add restored-name /path/from/recovery_path`.
+
+
 ### View all reported quota pools
 
 In the dashboard, select an account and press `V` to open **Quota Pools**.
