@@ -53,6 +53,10 @@ Project links:
 
 ## Install
 
+Version **0.2.4** adds quota-pool failover settings, separate Argon tracking,
+confirmed account removal, a paged two-column overview, and login isolation
+fixes. Existing quota policies remain unchanged until you save pool settings.
+
 The manager runs as your normal user; it does not require root or a system
 service. Python 3.10+ must be installed. A virtual environment keeps the package
 separate from system Python, but you do not need to activate one manually when
@@ -63,7 +67,7 @@ using `pipx`.
 With `pipx` installed, install the release wheel:
 
 ```bash
-pipx install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+pipx install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl
 pipx ensurepath
 ```
 
@@ -81,7 +85,7 @@ runs `agy`; its default data directory is `~/.agy-cli-manager`.
 To replace an existing pipx installation with this release:
 
 ```bash
-pipx install --force https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+pipx install --force https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl
 ```
 
 ### Alternative: explicit virtual environment
@@ -91,13 +95,13 @@ From a GitHub release wheel:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+python -m pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl
 ```
 
 To upgrade an existing installation to this release:
 
 ```bash
-python -m pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+python -m pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl
 ```
 
 Activate that environment in each new terminal, or run `.venv/bin/agy-cli-manager`

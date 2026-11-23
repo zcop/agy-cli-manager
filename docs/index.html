@@ -206,24 +206,25 @@
       <h2>Install</h2>
       <p>Requires Python 3.10+ and a working <code>agy</code> binary. Run as your normal user; no root or system service is required.</p>
       <p>Recommended: with <code>pipx</code> installed, install the release into an automatically managed environment:</p>
-      <pre><code>pipx install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl
+      <pre><code>pipx install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl
 pipx ensurepath</code></pre>
       <p>Open a new terminal, then run <code>agy-cli-manager dashboard</code>. No environment activation is needed. Run the manager as the same user who runs <code>agy</code>; data defaults to <code>~/.agy-cli-manager</code>.</p>
       <p>To replace an existing pipx installation with this release:</p>
-      <pre><code>pipx install --force https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl</code></pre>
+      <pre><code>pipx install --force https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl</code></pre>
       <p>Alternatively, use an explicit virtual environment:</p>
       <pre><code>python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.3/agy_cli_manager-0.2.3-py3-none-any.whl</code></pre>
+python -m pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.4/agy_cli_manager-0.2.4-py3-none-any.whl</code></pre>
       <p>Activate it in each new terminal, or run <code>.venv/bin/agy-cli-manager</code> directly. Avoid <code>sudo pip install</code> into system Python.</p>
-      <p><strong>Safety notice:</strong> v0.2.0 can delete files in <code>~/.gemini</code>, <code>~/.local</code>, <code>~/.cache</code>, and <code>~/.config</code> during login or account switching. If you installed v0.2.0, upgrade to v0.2.3 before using those commands.</p>
+      <p><strong>Safety notice:</strong> v0.2.0 can delete files in <code>~/.gemini</code>, <code>~/.local</code>, <code>~/.cache</code>, and <code>~/.config</code> during login or account switching. If you installed v0.2.0, upgrade to v0.2.4 before using those commands.</p>
     </section>
 
     <section class="section">
       <h2>Quota pools and failover settings</h2>
-      <p>The updated workspace code lists all discovered quota pools, including Gemini 4 Argon. In the dashboard, press <code>V</code> to view limits and reset times, then <code>U</code> to explicitly refresh that account.</p>
+      <p>Version 0.2.4 lists all discovered quota pools, including Gemini 4 Argon. In the dashboard, press <code>V</code> to view limits and reset times, then <code>U</code> to explicitly refresh that account.</p>
+      <p>Press <code>D</code> to remove a standby account with confirmation and a private recovery copy. Wide terminals use two overview columns; Left/Right pages extra details while preserving account-list space.</p>
       <p>Press <code>F</code> for quota settings: check one or several pools with Space, select all with A, choose ANY or ALL with M, adjust the remaining threshold with +/-, and save with S. Esc cancels. Newly discovered pools start unchecked. <code>B</code> toggles the saved quota policy; automatic switching also requires Auto mode.</p>
-      <p>ANY requires all checked pools available on the replacement. ALL requires at least one available. Unknown or stale quotas never prove availability. If no standby qualifies, the current account remains selected. These changes are not yet in the v0.2.3 release wheel above.</p>
+      <p>ANY requires all checked pools available on the replacement. ALL requires at least one available. Unknown or stale quotas never prove availability. If no standby qualifies, the current account remains selected.</p>
       <pre><code>agy-cli-manager quota-pools my-account --refresh --json
 agy-cli-manager quota-policy --enabled on --match any --pool "Gemini Models" --pool "Gemini 4 Argon" --threshold 10 --json</code></pre>
       <h2>Core Features</h2>

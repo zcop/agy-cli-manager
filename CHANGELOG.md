@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.2.4 - 2026-11-23
 
+- query the daily Cloud Code backend and fill missing family quota from per-model buckets, preferring current limits and later resets
 - use two overview columns on wide terminals and page extra details while reserving account-list space
 - add confirmed standby account removal (`D` in the TUI, `remove` CLI, and Python API) with private recovery copies and active-account protection
 - normalize UTC `Z` timestamps before ISO parsing so quota discovery also works on Python 3.10
