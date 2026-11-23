@@ -915,6 +915,20 @@ def _draw_detail_block(
     return 1 + len(rows)
 
 
+def _overview_layout(height: int, width: int, header_y: int, count: int, page: int = 0) -> dict:
+    columns = 2 if width >= 110 else 1
+    # Reserve half the remaining body for the account list.
+    available = max(0, height - header_y - 6)
+    detail_rows = min((count + columns - 1) // columns, available // 2)
+    list_rows = max(0, height - header_y - detail_rows - 6)
+    capacity = detail_rows * columns
+    pages = max(1, (count + capacity - 1) // capacity) if capacity else 1
+    page = max(0, min(page, pages - 1))
+    return {"columns": columns, "rows": detail_rows, "capacity": capacity,
+            "page": page, "pages": pages, "start": page * capacity,
+            "top": height - 3 - detail_rows, "list_rows": list_rows}
+
+
 def _account_table_layout(width: int) -> list[dict[str, str | int]]:
     if width >= 116:
         return [
@@ -1572,6 +1586,7 @@ def _proxy_dashboard(stdscr, paths) -> int:
 
 
 def _dashboard(stdscr, paths) -> int:
+    overview_page = 0
     _init_dashboard_colors()
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -1679,8 +1694,6 @@ def _dashboard(stdscr, paths) -> int:
 
         compact_detail_mode = height <= 26
         now_dt = datetime.now(timezone.utc)
-        available_width = max(20, width - 1)
-        use_two_columns = available_width >= 110 and not compact_detail_mode
         if accounts:
             selected_name, selected_meta = accounts[selected_idx]
             verification = verification_accounts.get(selected_name, {}) if isinstance(verification_accounts.get(selected_name), dict) else {}
@@ -1749,13 +1762,12 @@ def _dashboard(stdscr, paths) -> int:
                     overview_rows.append((pool, " | ".join(values), _severity_attr("info")))
             overview_rows.append(("Pools [V]", f"{pool_count} cached | V view all, U inside to refresh", _severity_attr("info")))
         overview_rows.append(("Quota B/F", _quota_policy_summary(snapshot["quota_policy"]), _severity_attr("info")))
-        overview_panel_height = 1 + len(overview_rows)
-
-        overview_top = max(header_y + 3, (height - 2) - overview_panel_height)
-        middle_end_y = max(header_y + 2, overview_top - 1)
-        max_list_rows = max(1, middle_end_y - (header_y + 2))
+        overview_layout = _overview_layout(height, width, header_y, len(overview_rows), overview_page)
+        overview_page = overview_layout['page']
+        overview_top = overview_layout['top']
+        max_list_rows = overview_layout['list_rows']
         scroll_offset = 0
-        if selected_idx >= max_list_rows:
+        if max_list_rows and selected_idx >= max_list_rows:
             scroll_offset = selected_idx - max_list_rows + 1
 
         visible_accounts = accounts[scroll_offset : scroll_offset + max_list_rows]
@@ -1776,14 +1788,19 @@ def _dashboard(stdscr, paths) -> int:
             )
 
         _draw_hline(stdscr, overview_top - 1, "=")
-        _safe_addstr(stdscr, overview_top, 0, "Overview", _color_attr(COLOR_SECTION, curses.A_BOLD))
+        title = f"Overview | Details {overview_page + 1}/{overview_layout['pages']} | Left/Right: page"
+        _safe_addstr(stdscr, overview_top, 0, title, _color_attr(COLOR_SECTION, curses.A_BOLD))
         overview_y = overview_top + 1
-        for idx, (label, value, value_attr) in enumerate(overview_rows):
+        start = overview_layout['start']
+        visible_details = overview_rows[start:start + overview_layout['capacity']]
+        cell_width = max(1, (width - 1 - (overview_layout['columns'] - 1) * 3) // overview_layout['columns'])
+        for idx, (label, value, value_attr) in enumerate(visible_details):
+            column, row = divmod(idx, overview_layout['rows'])
             _draw_labeled_value_cell(
                 stdscr,
-                overview_y + idx,
-                0,
-                max(20, width - 1),
+                overview_y + row,
+                column * (cell_width + 3),
+                cell_width,
                 label,
                 value,
                 value_attr,
@@ -1835,6 +1852,10 @@ def _dashboard(stdscr, paths) -> int:
 
         if key in (ord("q"), ord("Q")):
             return 0
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            direction = -1 if key in (curses.KEY_LEFT, curses.KEY_PPAGE) else 1
+            overview_page = (overview_page + direction) % overview_layout['pages']
+            continue
         if key in (curses.KEY_UP, ord("k"), ord("K")) and selected_idx > 0:
             selected_idx -= 1
             continue

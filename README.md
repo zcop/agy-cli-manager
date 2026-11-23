@@ -146,6 +146,10 @@ runtime, OS keyring, other accounts, and switch history are preserved. The
 Python API is `remove_account(paths, name)`. A recovery profile can be imported
 again with `agy-cli-manager add restored-name /path/from/recovery_path`.
 
+The main overview uses two columns on terminals at least 110 characters wide,
+including short terminals. It reserves at least half the available body for the
+account list. Extra details are paged with Left/Right or Page Up/Page Down;
+Up/Down continues to select accounts. The overview header shows the detail page.
 
 ### View all reported quota pools
 
